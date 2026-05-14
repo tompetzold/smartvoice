@@ -1,99 +1,131 @@
-import type {RefObject} from "react";
-
-type SentenceSegment = {
-  id: string;
+type ReadingUnit = {
+  unitId: string;
   text: string;
+  type: string;
+  source: string;
   pageNumber: number;
   pageNumbers: number[];
-  wordIds: string[];
   lineBoxes: number[][];
-  type: string;
-  readMode: string;
-  pauseAfterMs: number;
+  wordIds: string[];
 };
 
 type PlayerBarProps = {
-  audioRef: RefObject<HTMLAudioElement | null>;
-  activeSegment: SentenceSegment | null;
-  activeSegmentIndex: number;
-  segmentCount: number;
+  activeUnit: ReadingUnit | null;
+  activeChunkIndex: number;
+  chunkCount: number;
   isPlaying: boolean;
   isLoadingAudio: boolean;
+  hasVoice: boolean;
+  currentGlobalSeconds: number;
+  estimatedTotalSeconds: number;
+  playbackRate: number;
+  autoScrollEnabled: boolean;
   onPlayPause: () => void;
-  onPrevious: () => void;
-  onNext: () => void;
-  onSeekSegment: (index: number) => void;
-  onAudioEnded: () => void;
+  onStop: () => void;
+  onSeekGlobalTime: (seconds: number) => void;
+  onPlaybackRateChange: (rate: number) => void;
+  onAutoScrollChange: (enabled: boolean) => void;
 };
 
-function formatSegmentLabel(activeSegmentIndex: number, segmentCount: number): string {
-  if (segmentCount <= 0) {
-    return "Kein Segment";
+function formatTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return "00:00";
   }
 
-  return `Segment ${activeSegmentIndex + 1} / ${segmentCount}`;
+  const totalSeconds = Math.floor(seconds);
+  const minutes = Math.floor(totalSeconds / 60);
+  const restSeconds = totalSeconds % 60;
+
+  return `${String(minutes).padStart(2, "0")}:${String(restSeconds).padStart(2, "0")}`;
 }
 
 export default function PlayerBar({
-  audioRef,
-  activeSegment,
-  activeSegmentIndex,
-  segmentCount,
+  activeUnit,
+  activeChunkIndex,
+  chunkCount,
   isPlaying,
   isLoadingAudio,
+  hasVoice,
+  currentGlobalSeconds,
+  estimatedTotalSeconds,
+  playbackRate,
+  autoScrollEnabled,
   onPlayPause,
-  onPrevious,
-  onNext,
-  onSeekSegment,
-  onAudioEnded,
+  onStop,
+  onSeekGlobalTime,
+  onPlaybackRateChange,
+  onAutoScrollChange,
 }: PlayerBarProps) {
+  const canPlay = chunkCount > 0 && hasVoice && !isLoadingAudio;
+  const effectiveCurrentSeconds = currentGlobalSeconds / playbackRate;
+  const effectiveTotalSeconds = estimatedTotalSeconds / playbackRate;
+
   return (
     <section className="player-shell">
-      <audio ref={audioRef} onEnded={onAudioEnded} />
-
-      <div className="player-main">
-        <button
-          className="player-button secondary"
-          type="button"
-          onClick={onPrevious}
-          disabled={segmentCount === 0 || activeSegmentIndex <= 0 || isLoadingAudio}
-        >
-          Zurück
-        </button>
-
-        <button
-          className="player-button primary"
-          type="button"
-          onClick={onPlayPause}
-          disabled={segmentCount === 0 || isLoadingAudio}
-        >
+      <div className="player-main compact">
+        <button className="player-button primary" type="button" onClick={onPlayPause} disabled={!canPlay}>
           {isLoadingAudio ? "Lädt..." : isPlaying ? "Pause" : "Play"}
         </button>
 
         <button
           className="player-button secondary"
           type="button"
-          onClick={onNext}
-          disabled={segmentCount === 0 || activeSegmentIndex >= segmentCount - 1 || isLoadingAudio}
+          onClick={onStop}
+          disabled={!hasVoice || chunkCount === 0 || isLoadingAudio}
         >
-          Weiter
+          Stop
         </button>
       </div>
 
       <div className="player-meta">
-        <strong>{formatSegmentLabel(activeSegmentIndex, segmentCount)}</strong>
-        <span>{activeSegment?.text ?? "Keine TTS-Segmente geladen."}</span>
+        <strong>
+          {hasVoice
+            ? `${formatTime(effectiveCurrentSeconds)} / ${formatTime(effectiveTotalSeconds)} · Chunk ${
+                activeChunkIndex + 1
+              } / ${chunkCount}`
+            : "Keine Piper-Stimme gefunden"}
+        </strong>
+        <span>{activeUnit?.text ?? "Lege eine Piper-Stimme unter backend/data/piper_voices ab."}</span>
       </div>
 
-      <input
-        className="player-seeker"
-        type="range"
-        min="0"
-        max={Math.max(0, segmentCount - 1)}
-        value={segmentCount > 0 ? activeSegmentIndex : 0}
-        onChange={(event) => onSeekSegment(Number(event.target.value))}
-        disabled={segmentCount === 0 || isLoadingAudio}
-      />
+      <div className="player-right">
+        <input
+          className="player-seeker"
+          type="range"
+          min="0"
+          max={Math.max(0, estimatedTotalSeconds)}
+          step="0.1"
+          value={Math.min(currentGlobalSeconds, Math.max(0, estimatedTotalSeconds))}
+          onChange={(event) => onSeekGlobalTime(Number(event.target.value))}
+          disabled={!hasVoice || chunkCount === 0 || isLoadingAudio}
+        />
+
+        <div className="player-options">
+          <div className="speed-control">
+            <span>Speed</span>
+            <input
+              type="range"
+              min="0.1"
+              max="2.0"
+              step="0.05"
+              value={playbackRate}
+              onChange={(event) => onPlaybackRateChange(Number(event.target.value))}
+              disabled={!hasVoice || chunkCount === 0}
+            />
+            <strong>{playbackRate.toFixed(2)}x</strong>
+          </div>
+
+          <label className="autoscroll-toggle">
+            <input
+              type="checkbox"
+              checked={autoScrollEnabled}
+              onChange={(event) => onAutoScrollChange(event.target.checked)}
+              disabled={chunkCount === 0}
+            />
+            <span>AutoScroll</span>
+          </label>
+        </div>
+      </div>
     </section>
   );
 }

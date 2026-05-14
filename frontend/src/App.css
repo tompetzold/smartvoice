@@ -83,7 +83,8 @@ select:disabled {
   gap: 12px;
 }
 
-.document-select {
+.document-select,
+.voice-select {
   height: 40px;
   max-width: 220px;
   padding: 0 12px;
@@ -265,14 +266,26 @@ select:disabled {
   user-select: none;
 }
 
-.active-segment-highlight {
+.segment-hitbox {
   position: absolute;
   z-index: 5;
+  border: 0;
   border-radius: 7px;
+  background: transparent;
+  outline: 0;
+  cursor: pointer;
+  padding: 0;
+}
+
+.segment-hitbox:hover {
+  background: rgba(255, 220, 116, 0.24);
+  outline: 2px solid rgba(251, 146, 60, 0.48);
+}
+
+.segment-hitbox.active {
   background: rgba(255, 220, 116, 0.48);
   outline: 2px solid rgba(251, 146, 60, 0.88);
   box-shadow: 0 0 0 1px rgba(255, 247, 237, 0.72) inset;
-  pointer-events: none;
 }
 
 .player-shell {
@@ -281,11 +294,11 @@ select:disabled {
   bottom: 22px;
   z-index: 50;
   display: grid;
-  grid-template-columns: auto minmax(360px, 680px) minmax(180px, 260px);
+  grid-template-columns: auto minmax(360px, 680px) minmax(320px, 420px);
   align-items: center;
   gap: 18px;
-  width: min(1120px, calc(100vw - 44px));
-  min-height: 86px;
+  width: min(1260px, calc(100vw - 44px));
+  min-height: 94px;
   padding: 14px 18px;
   border: 1px solid rgba(226, 232, 240, 0.96);
   border-radius: 26px;
@@ -299,6 +312,10 @@ select:disabled {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.player-main.compact {
+  min-width: 230px;
 }
 
 .player-button {
@@ -353,8 +370,58 @@ select:disabled {
   text-overflow: ellipsis;
 }
 
+.player-right {
+  display: grid;
+  grid-template-rows: auto auto;
+  gap: 10px;
+  min-width: 320px;
+}
+
 .player-seeker {
   width: 100%;
+}
+
+.player-options {
+  display: grid;
+  grid-template-columns: minmax(190px, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+}
+
+.speed-control {
+  display: grid;
+  grid-template-columns: auto minmax(100px, 1fr) 48px;
+  align-items: center;
+  gap: 10px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.speed-control input {
+  width: 100%;
+}
+
+.speed-control strong {
+  color: #111827;
+  font-size: 12px;
+  text-align: right;
+}
+
+.autoscroll-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.autoscroll-toggle input {
+  width: 16px;
+  height: 16px;
+  accent-color: #4f46e5;
 }
 
 @keyframes spin {
