@@ -273,6 +273,37 @@ function App() {
   }, []);
 
   useEffect(() => {
+    function handleSpaceKey(event: KeyboardEvent) {
+      if (event.code !== "Space") {
+        return;
+      }
+
+      const target = event.target;
+
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) {
+        return;
+      }
+
+      if (target instanceof HTMLElement && target.isContentEditable) {
+        return;
+      }
+
+      if (!documentData || chunks.length === 0) {
+        return;
+      }
+
+      event.preventDefault();
+      void handlePlayPause();
+    }
+
+    window.addEventListener("keydown", handleSpaceKey);
+
+    return () => {
+      window.removeEventListener("keydown", handleSpaceKey);
+    };
+  }, [documentData, chunks.length, isPlaying, activeChunkIndex, currentChunkLocalSeconds, selectedVoiceId, playbackRate]);
+
+  useEffect(() => {
     const audio = audioRef.current;
 
     if (!audio) {
@@ -723,28 +754,6 @@ function App() {
     setIsLoadingAudio(false);
   }
 
-  function stopAndResetPlayback() {
-    if (audioRef.current) {
-      audioRef.current.pause();
-      audioRef.current.removeAttribute("src");
-      audioRef.current.load();
-    }
-
-    setIsPlaying(false);
-    setIsLoadingAudio(false);
-    setActiveChunkIndex(0);
-    setActiveUnitId(chunks[0]?.units[0]?.unitId ?? "");
-    setCurrentChunkLocalSeconds(0);
-    lastAutoScrolledUnitIdRef.current = "";
-
-    const firstUnit = chunks[0]?.units[0];
-
-    if (firstUnit && autoScrollEnabled) {
-      scrollToUnit(firstUnit, "smooth");
-      lastAutoScrolledUnitIdRef.current = firstUnit.unitId;
-    }
-  }
-
   function handleFileInput(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
 
@@ -855,12 +864,23 @@ function App() {
       <header className="topbar">
         <div className="topbar-title">
           <h1>SmartVoice</h1>
-          <p>Lokaler PDF-Reader mit Chunk-Buffering, Piper-TTS und Segment-Highlighting.</p>
         </div>
+      </header>
 
-        <div className="toolbar">
+      <aside className="sidebar">
+        <div className="sidebar-logo">SV</div>
+
+        <label className="sidebar-item file-sidebar-button">
+          <span className="sidebar-icon">＋</span>
+          <span className="sidebar-label">PDF</span>
+          <input type="file" accept="application/pdf,.pdf" onChange={handleFileInput} />
+        </label>
+
+        <div className="sidebar-item sidebar-select-item">
+          <span className="sidebar-icon">📄</span>
+          <span className="sidebar-label">Datei</span>
           <select
-            className="document-select"
+            className="sidebar-select"
             value={documentData?.documentId ?? ""}
             onChange={(event) => {
               if (event.target.value) {
@@ -868,46 +888,75 @@ function App() {
               }
             }}
           >
-            <option value="">Gespeicherte PDFs</option>
+            <option value="">Auswählen</option>
             {documents.map((document) => (
               <option value={document.documentId} key={document.documentId}>
                 {document.filename}
               </option>
             ))}
           </select>
+        </div>
 
+        <div className="sidebar-item sidebar-select-item">
+          <span className="sidebar-icon">●</span>
+          <span className="sidebar-label">Voice</span>
           <select
-            className="voice-select"
+            className="sidebar-select"
             value={selectedVoiceId}
             onChange={(event) => handleVoiceChange(event.target.value)}
             disabled={voices.length === 0}
           >
-            {voices.length === 0 && <option value="">Keine Stimme</option>}
+            {voices.length === 0 && <option value="">Keine</option>}
             {voices.map((voice) => (
               <option value={voice.id} key={voice.id}>
                 {voice.name}
               </option>
             ))}
           </select>
-
-          <label className="file-button">
-            PDF auswählen
-            <input type="file" accept="application/pdf,.pdf" onChange={handleFileInput} />
-          </label>
-
-          <div className="zoom-control">
-            <span>Zoom</span>
-            <input
-              type="range"
-              min="35"
-              max="110"
-              value={Math.round(zoom * 100)}
-              onChange={(event) => setZoom(Number(event.target.value) / 100)}
-            />
-            <span>{Math.round(zoom * 100)}%</span>
-          </div>
         </div>
-      </header>
+
+        <button
+          className={`sidebar-item sidebar-toggle ${autoScrollEnabled ? "active" : ""}`}
+          type="button"
+          onClick={() => handleAutoScrollChange(!autoScrollEnabled)}
+          disabled={chunks.length === 0}
+        >
+          <span className="sidebar-icon">⇣</span>
+          <span className="sidebar-label">Auto</span>
+        </button>
+
+        <div className="sidebar-item sidebar-slider-item">
+          <span className="sidebar-icon">↕</span>
+          <span className="sidebar-label">{Math.round(zoom * 100)}%</span>
+          <input
+            className="sidebar-vertical-slider"
+            type="range"
+            min="35"
+            max="110"
+            value={Math.round(zoom * 100)}
+            onChange={(event) => setZoom(Number(event.target.value) / 100)}
+            aria-label="Zoom"
+          />
+          <span className="sidebar-small-label">Zoom</span>
+        </div>
+
+        <div className="sidebar-item sidebar-slider-item">
+          <span className="sidebar-icon">×</span>
+          <span className="sidebar-label">{playbackRate.toFixed(2)}x</span>
+          <input
+            className="sidebar-vertical-slider"
+            type="range"
+            min="0.1"
+            max="2.0"
+            step="0.05"
+            value={playbackRate}
+            onChange={(event) => handlePlaybackRateChange(Number(event.target.value))}
+            disabled={chunks.length === 0}
+            aria-label="Speed"
+          />
+          <span className="sidebar-small-label">Speed</span>
+        </div>
+      </aside>
 
       <section
         className={`dropzone ${isDragging ? "dragging" : ""}`}
@@ -963,23 +1012,17 @@ function App() {
       </section>
 
       <PlayerBar
-        activeUnit={activeUnit}
-        activeChunkIndex={activeChunkIndex}
-        chunkCount={chunks.length}
         isPlaying={isPlaying}
         isLoadingAudio={isLoadingAudio}
         hasVoice={hasVoice}
+        chunkCount={chunks.length}
         currentGlobalSeconds={currentGlobalSeconds}
         estimatedTotalSeconds={estimatedTotalSeconds}
         playbackRate={playbackRate}
-        autoScrollEnabled={autoScrollEnabled}
         onPlayPause={() => {
           void handlePlayPause();
         }}
-        onStop={stopAndResetPlayback}
         onSeekGlobalTime={seekToGlobalTime}
-        onPlaybackRateChange={handlePlaybackRateChange}
-        onAutoScrollChange={handleAutoScrollChange}
       />
     </main>
   );
