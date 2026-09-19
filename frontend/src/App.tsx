@@ -92,6 +92,7 @@ const API_BASE_URL = "http://127.0.0.1:8001";
 const PRELOAD_CHUNK_COUNT = 3;
 const PROGRAMMATIC_SCROLL_GRACE_MS = 1200;
 const USER_SCROLL_SETTLE_MS = 650;
+const ZOOM_STEPS = [0.45, 0.55, 0.65, 0.75, 0.9, 1.0, 1.15, 1.3, 1.5, 1.75];
 
 function App() {
   const [documentData, setDocumentData] = useState<DocumentData | null>(null);
@@ -108,10 +109,15 @@ function App() {
   const [currentChunkLocalSeconds, setCurrentChunkLocalSeconds] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [volume, setVolume] = useState(1.0);
   const [autoScrollEnabled, setAutoScrollEnabled] = useState(true);
   const [chunkAudio, setChunkAudio] = useState<Record<string, ChunkAudioResponse>>({});
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const viewerRef = useRef<HTMLElement | null>(null);
+  const zoomRef = useRef(zoom);
+  const pinchAccumulatorRef = useRef(0);
+  const pinchLastStepAtRef = useRef(0);
   const pageRefs = useRef<Record<number, HTMLElement | null>>({});
   const preloadInFlightRef = useRef<Set<string>>(new Set());
   const lastAutoScrolledUnitIdRef = useRef("");
@@ -195,6 +201,74 @@ function App() {
   }, [autoScrollEnabled]);
 
   useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  useEffect(() => {
+    const viewer = viewerRef.current;
+
+    if (!viewer) {
+      return;
+    }
+
+    function handlePinchZoom(event: WheelEvent) {
+      if (!event.ctrlKey) {
+        return;
+      }
+
+      event.preventDefault();
+
+      if (!documentData || pages.length === 0) {
+        return;
+      }
+
+      pinchAccumulatorRef.current += event.deltaY;
+
+      const now = Date.now();
+
+      if (Math.abs(pinchAccumulatorRef.current) < 12 || now - pinchLastStepAtRef.current < 120) {
+        return;
+      }
+
+      const currentZoom = zoomRef.current;
+      const currentIndex = ZOOM_STEPS.reduce((bestIndex, step, index) => {
+        const bestDistance = Math.abs(ZOOM_STEPS[bestIndex] - currentZoom);
+        const currentDistance = Math.abs(step - currentZoom);
+        return currentDistance < bestDistance ? index : bestIndex;
+      }, 0);
+      const direction = pinchAccumulatorRef.current < 0 ? 1 : -1;
+      const nextIndex = Math.max(0, Math.min(ZOOM_STEPS.length - 1, currentIndex + direction));
+      const nextZoom = ZOOM_STEPS[nextIndex];
+
+      pinchAccumulatorRef.current = 0;
+      pinchLastStepAtRef.current = now;
+
+      if (nextZoom === currentZoom) {
+        return;
+      }
+
+      const rect = viewer.getBoundingClientRect();
+      const pointerX = event.clientX - rect.left + viewer.scrollLeft;
+      const pointerY = event.clientY - rect.top + viewer.scrollTop;
+      const ratio = nextZoom / currentZoom;
+
+      zoomRef.current = nextZoom;
+      setZoom(nextZoom);
+
+      window.requestAnimationFrame(() => {
+        viewer.scrollLeft = pointerX * ratio - (event.clientX - rect.left);
+        viewer.scrollTop = pointerY * ratio - (event.clientY - rect.top);
+      });
+    }
+
+    viewer.addEventListener("wheel", handlePinchZoom, { passive: false });
+
+    return () => {
+      viewer.removeEventListener("wheel", handlePinchZoom);
+    };
+  }, [documentData, pages.length]);
+
+  useEffect(() => {
     void loadDocuments();
     void loadVoices();
   }, []);
@@ -206,6 +280,14 @@ function App() {
 
     audioRef.current.playbackRate = playbackRate;
   }, [playbackRate]);
+
+  useEffect(() => {
+    if (!audioRef.current) {
+      return;
+    }
+
+    audioRef.current.volume = volume;
+  }, [volume]);
 
   useEffect(() => {
     if (!activeUnit || !autoScrollEnabled) {
@@ -221,6 +303,12 @@ function App() {
   }, [activeUnit, autoScrollEnabled]);
 
   useEffect(() => {
+    const viewer = viewerRef.current;
+
+    if (!viewer) {
+      return;
+    }
+
     function scheduleAutoScrollDisableCheck() {
       if (!autoScrollEnabledRef.current) {
         return;
@@ -255,15 +343,15 @@ function App() {
 
         if (!stillVisible) {
           setAutoScrollEnabled(false);
-          setStatus("AutoScroll deaktiviert: aktueller Lesebereich wurde verlassen.");
+          setStatus("Automatisch folgen deaktiviert: Lesestelle wurde manuell verlassen.");
         }
       }, USER_SCROLL_SETTLE_MS);
     }
 
-    window.addEventListener("scroll", scheduleAutoScrollDisableCheck, { passive: true });
+    viewer.addEventListener("scroll", scheduleAutoScrollDisableCheck, { passive: true });
 
     return () => {
-      window.removeEventListener("scroll", scheduleAutoScrollDisableCheck);
+      viewer.removeEventListener("scroll", scheduleAutoScrollDisableCheck);
 
       if (userScrollTimerRef.current !== null) {
         window.clearTimeout(userScrollTimerRef.current);
@@ -369,6 +457,9 @@ function App() {
       return false;
     }
 
+    const viewer = viewerRef.current;
+    const viewerRect = viewer?.getBoundingClientRect() ?? { top: 0, right: window.innerWidth, bottom: window.innerHeight, left: 0 };
+
     return elements.some((element) => {
       const rect = element.getBoundingClientRect();
 
@@ -376,8 +467,8 @@ function App() {
         return false;
       }
 
-      const verticallyInsideViewport = rect.bottom > 0 && rect.top < window.innerHeight;
-      const horizontallyInsideViewport = rect.right > 0 && rect.left < window.innerWidth;
+      const verticallyInsideViewport = rect.bottom > viewerRect.top && rect.top < viewerRect.bottom;
+      const horizontallyInsideViewport = rect.right > viewerRect.left && rect.left < viewerRect.right;
 
       return verticallyInsideViewport && horizontallyInsideViewport;
     });
@@ -642,6 +733,7 @@ function App() {
       audioRef.current.src = `${API_BASE_URL}${data.audioUrl}`;
       audioRef.current.currentTime = Math.max(0, Math.min(data.duration, startLocalSeconds));
       audioRef.current.playbackRate = playbackRate;
+      audioRef.current.volume = volume;
       audioRef.current.load();
 
       await audioRef.current.play();
@@ -861,154 +953,125 @@ function App() {
     <main className="app-shell">
       <audio ref={audioRef} />
 
-      <header className="topbar">
-        <div className="topbar-title">
-          <h1>SmartVoice</h1>
+      <aside className="library-sidebar">
+        <div className="brand-row">
+          <div className="brand-mark">SV</div>
+          <div className="brand-name">SmartVoice</div>
         </div>
-      </header>
 
-      <aside className="sidebar">
-        <div className="sidebar-logo">SV</div>
-
-        <label className="sidebar-item file-sidebar-button">
-          <span className="sidebar-icon">＋</span>
-          <span className="sidebar-label">PDF</span>
+        <label className="add-document-button">
+          <span className="add-document-icon">＋</span>
+          <span>Hinzufügen</span>
           <input type="file" accept="application/pdf,.pdf" onChange={handleFileInput} />
         </label>
 
-        <div className="sidebar-item sidebar-select-item">
-          <span className="sidebar-icon">📄</span>
-          <span className="sidebar-label">Datei</span>
-          <select
-            className="sidebar-select"
-            value={documentData?.documentId ?? ""}
-            onChange={(event) => {
-              if (event.target.value) {
-                void loadDocument(event.target.value);
-              }
-            }}
-          >
-            <option value="">Auswählen</option>
-            {documents.map((document) => (
-              <option value={document.documentId} key={document.documentId}>
-                {document.filename}
-              </option>
-            ))}
-          </select>
-        </div>
+        <nav className="library-nav" aria-label="Dokumente">
+          <div className="library-section-title">Bibliothek</div>
+          <div className="library-search-placeholder">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <circle cx="8.5" cy="8.5" r="5.2" fill="none" stroke="currentColor" strokeWidth="1.5" />
+              <path d="m12.4 12.4 4 4" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
+            <span>Suchen</span>
+          </div>
 
-        <div className="sidebar-item sidebar-select-item">
-          <span className="sidebar-icon">●</span>
-          <span className="sidebar-label">Voice</span>
-          <select
-            className="sidebar-select"
-            value={selectedVoiceId}
-            onChange={(event) => handleVoiceChange(event.target.value)}
-            disabled={voices.length === 0}
-          >
-            {voices.length === 0 && <option value="">Keine</option>}
-            {voices.map((voice) => (
-              <option value={voice.id} key={voice.id}>
-                {voice.name}
-              </option>
-            ))}
-          </select>
-        </div>
+          <div className="document-list">
+            {documents.length === 0 && <div className="document-list-empty">Noch keine Dateien</div>}
+            {documents.map((document) => {
+              const active = document.documentId === documentData?.documentId;
 
-        <button
-          className={`sidebar-item sidebar-toggle ${autoScrollEnabled ? "active" : ""}`}
-          type="button"
-          onClick={() => handleAutoScrollChange(!autoScrollEnabled)}
-          disabled={chunks.length === 0}
-        >
-          <span className="sidebar-icon">⇣</span>
-          <span className="sidebar-label">Auto</span>
-        </button>
-
-        <div className="sidebar-item sidebar-slider-item">
-          <span className="sidebar-icon">↕</span>
-          <span className="sidebar-label">{Math.round(zoom * 100)}%</span>
-          <input
-            className="sidebar-vertical-slider"
-            type="range"
-            min="35"
-            max="110"
-            value={Math.round(zoom * 100)}
-            onChange={(event) => setZoom(Number(event.target.value) / 100)}
-            aria-label="Zoom"
-          />
-          <span className="sidebar-small-label">Zoom</span>
-        </div>
-
-        <div className="sidebar-item sidebar-slider-item">
-          <span className="sidebar-icon">×</span>
-          <span className="sidebar-label">{playbackRate.toFixed(2)}x</span>
-          <input
-            className="sidebar-vertical-slider"
-            type="range"
-            min="0.1"
-            max="2.0"
-            step="0.05"
-            value={playbackRate}
-            onChange={(event) => handlePlaybackRateChange(Number(event.target.value))}
-            disabled={chunks.length === 0}
-            aria-label="Speed"
-          />
-          <span className="sidebar-small-label">Speed</span>
-        </div>
+              return (
+                <button
+                  className={`document-list-item ${active ? "active" : ""}`}
+                  type="button"
+                  key={document.documentId}
+                  onClick={() => void loadDocument(document.documentId)}
+                >
+                  <span className="document-file-icon">PDF</span>
+                  <span className="document-file-name">{document.filename}</span>
+                </button>
+              );
+            })}
+          </div>
+        </nav>
       </aside>
 
-      <section
-        className={`dropzone ${isDragging ? "dragging" : ""}`}
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-      >
-        <strong>PDF hier ablegen</strong>
-        <span>Die Datei wird lokal gespeichert, gerendert und als Chunk-Queue vorbereitet.</span>
-      </section>
-
-      <section className="status-panel">
-        <span className={isUploading || isLoadingAudio ? "spinner" : "dot"} />
-        <span>{status}</span>
-      </section>
-
-      <section className="viewer">
-        {pages.length === 0 && !isUploading && (
-          <div className="empty-state">
-            <h2>Noch keine PDF geöffnet</h2>
-            <p>Zieh eine PDF-Datei in die Dropzone, wähle eine neue Datei aus oder öffne ein gespeichertes Dokument.</p>
+      <section className="reader-shell">
+        <header className="reader-topbar">
+          <div className="reader-title-group">
+            <strong>{documentData?.filename ?? "SmartVoice"}</strong>
+            {documentData && (
+              <nav className="reader-menu" aria-label="Dokumentmenü">
+                <span>Datei</span>
+                <span>Ansicht</span>
+                <span>Notizen</span>
+                <span>Einstellungen</span>
+              </nav>
+            )}
           </div>
-        )}
 
-        {pages.map((page) => (
-          <article
-            className="page-card"
-            key={page.pageNumber}
-            ref={(element) => {
-              pageRefs.current[page.pageNumber] = element;
-            }}
-          >
-            <div
-              className="page-stage"
-              style={{
-                width: `${page.width * zoom}px`,
-                height: `${page.height * zoom}px`,
+          <div className="reader-status">
+            <span className={isUploading || isLoadingAudio ? "status-spinner" : "status-dot"} />
+            <span>{status}</span>
+          </div>
+        </header>
+
+        <section
+          className={`viewer ${isDragging ? "dragging" : ""}`}
+          ref={viewerRef}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          {pages.length === 0 && !isUploading && (
+            <div className="empty-state">
+              <div className="empty-state-icon">＋</div>
+              <h2>PDF hinzufügen</h2>
+              <p>Zieh eine PDF hier hinein oder wähle links über „Hinzufügen“ eine Datei aus.</p>
+              <label className="empty-add-button">
+                <span>＋</span>
+                <span>Hinzufügen</span>
+                <input type="file" accept="application/pdf,.pdf" onChange={handleFileInput} />
+              </label>
+            </div>
+          )}
+
+          {isUploading && (
+            <div className="loading-document">
+              <span className="large-spinner" />
+              <strong>PDF wird vorbereitet …</strong>
+            </div>
+          )}
+
+          {pages.map((page) => (
+            <article
+              className="page-card"
+              key={page.pageNumber}
+              ref={(element) => {
+                pageRefs.current[page.pageNumber] = element;
               }}
             >
-              <img
-                src={`${API_BASE_URL}${page.imageUrl}`}
-                alt={`Seite ${page.pageNumber}`}
+              <div
+                className="page-stage"
                 style={{
                   width: `${page.width * zoom}px`,
                   height: `${page.height * zoom}px`,
                 }}
-                draggable={false}
-              />
-              {renderUnitHighlights(page)}
-            </div>
-          </article>
-        ))}
+              >
+                <img
+                  src={`${API_BASE_URL}${page.imageUrl}`}
+                  alt={`Seite ${page.pageNumber}`}
+                  style={{
+                    width: `${page.width * zoom}px`,
+                    height: `${page.height * zoom}px`,
+                  }}
+                  draggable={false}
+                />
+                {renderUnitHighlights(page)}
+              </div>
+            </article>
+          ))}
+        </section>
       </section>
 
       <PlayerBar
@@ -1019,10 +1082,18 @@ function App() {
         currentGlobalSeconds={currentGlobalSeconds}
         estimatedTotalSeconds={estimatedTotalSeconds}
         playbackRate={playbackRate}
+        volume={volume}
+        voices={voices}
+        selectedVoiceId={selectedVoiceId}
+        autoScrollEnabled={autoScrollEnabled}
         onPlayPause={() => {
           void handlePlayPause();
         }}
         onSeekGlobalTime={seekToGlobalTime}
+        onPlaybackRateChange={handlePlaybackRateChange}
+        onVolumeChange={setVolume}
+        onVoiceChange={handleVoiceChange}
+        onAutoScrollChange={handleAutoScrollChange}
       />
     </main>
   );
