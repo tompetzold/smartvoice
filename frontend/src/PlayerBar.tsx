@@ -1,99 +1,104 @@
-import type {RefObject} from "react";
-
-type SentenceSegment = {
-  id: string;
-  text: string;
-  pageNumber: number;
-  pageNumbers: number[];
-  wordIds: string[];
-  lineBoxes: number[][];
-  type: string;
-  readMode: string;
-  pauseAfterMs: number;
-};
-
 type PlayerBarProps = {
-  audioRef: RefObject<HTMLAudioElement | null>;
-  activeSegment: SentenceSegment | null;
-  activeSegmentIndex: number;
-  segmentCount: number;
   isPlaying: boolean;
   isLoadingAudio: boolean;
+  hasVoice: boolean;
+  chunkCount: number;
+  currentGlobalSeconds: number;
+  estimatedTotalSeconds: number;
+  playbackRate: number;
   onPlayPause: () => void;
-  onPrevious: () => void;
-  onNext: () => void;
-  onSeekSegment: (index: number) => void;
-  onAudioEnded: () => void;
+  onSeekGlobalTime: (seconds: number) => void;
 };
 
-function formatSegmentLabel(activeSegmentIndex: number, segmentCount: number): string {
-  if (segmentCount <= 0) {
-    return "Kein Segment";
+function formatTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return "0:00";
   }
 
-  return `Segment ${activeSegmentIndex + 1} / ${segmentCount}`;
+  const totalSeconds = Math.floor(seconds);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const restSeconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(restSeconds).padStart(2, "0")}`;
+  }
+
+  return `${minutes}:${String(restSeconds).padStart(2, "0")}`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
 }
 
 export default function PlayerBar({
-  audioRef,
-  activeSegment,
-  activeSegmentIndex,
-  segmentCount,
   isPlaying,
   isLoadingAudio,
+  hasVoice,
+  chunkCount,
+  currentGlobalSeconds,
+  estimatedTotalSeconds,
+  playbackRate,
   onPlayPause,
-  onPrevious,
-  onNext,
-  onSeekSegment,
-  onAudioEnded,
+  onSeekGlobalTime,
 }: PlayerBarProps) {
+  const canPlay = chunkCount > 0 && hasVoice && !isLoadingAudio;
+  const effectiveCurrentSeconds = currentGlobalSeconds / playbackRate;
+  const effectiveTotalSeconds = estimatedTotalSeconds / playbackRate;
+  const progressValue = clamp(currentGlobalSeconds, 0, Math.max(0, estimatedTotalSeconds));
+
+  function seekRelative(offsetSeconds: number) {
+    const nextSeconds = clamp(currentGlobalSeconds + offsetSeconds, 0, Math.max(0, estimatedTotalSeconds));
+    onSeekGlobalTime(nextSeconds);
+  }
+
   return (
-    <section className="player-shell">
-      <audio ref={audioRef} onEnded={onAudioEnded} />
-
-      <div className="player-main">
-        <button
-          className="player-button secondary"
-          type="button"
-          onClick={onPrevious}
-          disabled={segmentCount === 0 || activeSegmentIndex <= 0 || isLoadingAudio}
-        >
-          Zurück
-        </button>
-
-        <button
-          className="player-button primary"
-          type="button"
-          onClick={onPlayPause}
-          disabled={segmentCount === 0 || isLoadingAudio}
-        >
-          {isLoadingAudio ? "Lädt..." : isPlaying ? "Pause" : "Play"}
-        </button>
-
-        <button
-          className="player-button secondary"
-          type="button"
-          onClick={onNext}
-          disabled={segmentCount === 0 || activeSegmentIndex >= segmentCount - 1 || isLoadingAudio}
-        >
-          Weiter
-        </button>
-      </div>
-
-      <div className="player-meta">
-        <strong>{formatSegmentLabel(activeSegmentIndex, segmentCount)}</strong>
-        <span>{activeSegment?.text ?? "Keine TTS-Segmente geladen."}</span>
-      </div>
-
+    <section className="player-shell" aria-label="Audio Player">
       <input
-        className="player-seeker"
+        className="player-progress"
         type="range"
         min="0"
-        max={Math.max(0, segmentCount - 1)}
-        value={segmentCount > 0 ? activeSegmentIndex : 0}
-        onChange={(event) => onSeekSegment(Number(event.target.value))}
-        disabled={segmentCount === 0 || isLoadingAudio}
+        max={Math.max(0, estimatedTotalSeconds)}
+        step="0.1"
+        value={progressValue}
+        onChange={(event) => onSeekGlobalTime(Number(event.target.value))}
+        disabled={!hasVoice || chunkCount === 0 || isLoadingAudio}
+        aria-label="Position"
       />
+
+      <div className="player-controls">
+        <div className="player-time left">{hasVoice ? formatTime(effectiveCurrentSeconds) : "0:00"}</div>
+
+        <div className="player-buttons">
+          <button
+            className="player-skip-button"
+            type="button"
+            onClick={() => seekRelative(-10)}
+            disabled={!hasVoice || chunkCount === 0 || isLoadingAudio}
+            aria-label="10 Sekunden zurück"
+            title="10 Sekunden zurück"
+          >
+            -10
+          </button>
+
+          <button className="player-main-button" type="button" onClick={onPlayPause} disabled={!canPlay}>
+            {isLoadingAudio ? "…" : isPlaying ? "Ⅱ" : "▶"}
+          </button>
+
+          <button
+            className="player-skip-button"
+            type="button"
+            onClick={() => seekRelative(10)}
+            disabled={!hasVoice || chunkCount === 0 || isLoadingAudio}
+            aria-label="10 Sekunden vor"
+            title="10 Sekunden vor"
+          >
+            +10
+          </button>
+        </div>
+
+        <div className="player-time right">{hasVoice ? formatTime(effectiveTotalSeconds) : "0:00"}</div>
+      </div>
     </section>
   );
 }

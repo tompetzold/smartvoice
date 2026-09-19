@@ -3,12 +3,13 @@ import json
 import re
 import shutil
 import subprocess
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import fitz
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -17,11 +18,20 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 DOCUMENTS_DIR = DATA_DIR / "documents"
+PIPER_VOICES_DIR = DATA_DIR / "piper_voices"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+PIPER_VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="VoiceMaster Backend")
+PIPER_COMMAND = ["python", "-m", "piper"]
+DEFAULT_PIPER_VOICE_ID = "de_DE-thorsten-medium"
+RENDER_ZOOM = 2.0
+TARGET_CHUNK_CHARS = 700
+MAX_UNITS_PER_CHUNK = 5
+WORDS_PER_MINUTE_ESTIMATE = 165.0
+
+app = FastAPI(title="SmartVoice Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -70,7 +80,7 @@ ABBREVIATIONS = {
 
 def log(message: str) -> None:
     timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[VoiceMaster {timestamp}] {message}", flush=True)
+    print(f"[SmartVoice {timestamp}] {message}", flush=True)
 
 
 def now_iso() -> str:
@@ -87,6 +97,12 @@ def safe_stem(filename: str) -> str:
     cleaned = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in stem)
     cleaned = "_".join(part for part in cleaned.split("_") if part)
     return cleaned if cleaned else "document"
+
+
+def safe_id(value: str) -> str:
+    cleaned = "".join(char if char.isalnum() or char in ("-", "_", ".") else "_" for char in value.strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned if cleaned else "default"
 
 
 def hash_file(path: Path) -> str:
@@ -126,6 +142,25 @@ def write_metadata(document_id: str, metadata: dict[str, Any]) -> None:
 
 def normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_tts_text(text: str) -> str:
+    replacements = {
+        " KI ": " künstliche Intelligenz ",
+        " AI ": " Artificial Intelligence ",
+        " ML ": " Machine Learning ",
+        " LLM ": " Large Language Model ",
+        " PDF ": " P D F ",
+        " OCR ": " O C R ",
+        " TTS ": " Text to Speech ",
+    }
+
+    normalized = f" {normalize_spaces(text)} "
+
+    for source, target in replacements.items():
+        normalized = normalized.replace(source, target)
+
+    return normalize_spaces(normalized)
 
 
 def clean_token(token: str) -> str:
@@ -355,7 +390,7 @@ def merge_words_to_line_boxes(words: list[dict[str, Any]]) -> list[list[float]]:
     return boxes
 
 
-def create_segment(segment_index: int, words: list[dict[str, Any]], segment_type: str = "default") -> dict[str, Any] | None:
+def create_segment(segment_index: int, words: list[dict[str, Any]], segment_type: str = "text") -> dict[str, Any] | None:
     clean_words = [word for word in words if normalize_spaces(word["text"])]
 
     if not clean_words:
@@ -369,7 +404,7 @@ def create_segment(segment_index: int, words: list[dict[str, Any]], segment_type
     page_numbers = sorted({int(word["pageNumber"]) for word in clean_words})
 
     return {
-        "id": f"s_{segment_index:06d}",
+        "id": f"u_{segment_index:06d}",
         "text": text,
         "pageNumber": page_numbers[0],
         "pageNumbers": page_numbers,
@@ -378,6 +413,7 @@ def create_segment(segment_index: int, words: list[dict[str, Any]], segment_type
         "type": segment_type,
         "readMode": "tts_original",
         "pauseAfterMs": 250,
+        "source": "pdf_text",
     }
 
 
@@ -423,6 +459,79 @@ def build_default_segments(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return segments
 
 
+def estimate_text_duration_seconds(text: str) -> float:
+    words = [part for part in normalize_spaces(text).split(" ") if part]
+    word_count = max(1, len(words))
+    return max(1.0, word_count / WORDS_PER_MINUTE_ESTIMATE * 60.0)
+
+
+def build_tts_chunks(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    current_units: list[dict[str, Any]] = []
+    current_chars = 0
+
+    def flush() -> None:
+        nonlocal current_units
+        nonlocal current_chars
+
+        if not current_units:
+            return
+
+        chunk_index = len(chunks) + 1
+        chunk_id = f"c_{chunk_index:06d}"
+        text = normalize_spaces(" ".join(unit["text"] for unit in current_units))
+        page_numbers = sorted({page_number for unit in current_units for page_number in unit.get("pageNumbers", [])})
+
+        chunks.append(
+            {
+                "id": chunk_id,
+                "text": text,
+                "unitIds": [unit["id"] for unit in current_units],
+                "units": [
+                    {
+                        "unitId": unit["id"],
+                        "text": unit["text"],
+                        "type": unit.get("type", "text"),
+                        "source": unit.get("source", "pdf_text"),
+                        "pageNumber": unit.get("pageNumber"),
+                        "pageNumbers": unit.get("pageNumbers", []),
+                        "lineBoxes": unit.get("lineBoxes", []),
+                        "wordIds": unit.get("wordIds", []),
+                    }
+                    for unit in current_units
+                ],
+                "pageNumber": current_units[0].get("pageNumber"),
+                "pageNumbers": page_numbers,
+                "estimatedDuration": round(estimate_text_duration_seconds(text), 3),
+                "charCount": len(text),
+                "wordCount": len([part for part in text.split(" ") if part]),
+            }
+        )
+
+        current_units = []
+        current_chars = 0
+
+    for unit in units:
+        text = normalize_spaces(str(unit.get("text", "")))
+
+        if not text:
+            continue
+
+        next_chars = len(text)
+        would_exceed_chars = current_units and current_chars + next_chars > TARGET_CHUNK_CHARS
+        would_exceed_units = current_units and len(current_units) >= MAX_UNITS_PER_CHUNK
+
+        if would_exceed_chars or would_exceed_units:
+            flush()
+
+        current_units.append(unit)
+        current_chars += next_chars
+
+    flush()
+
+    return chunks
+
+
 def build_reading_blocks_from_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
 
@@ -443,87 +552,225 @@ def build_reading_blocks_from_segments(segments: list[dict[str, Any]]) -> list[d
     return blocks
 
 
-def extract_text_data(document: fitz.Document) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def extract_text_data(document: fitz.Document) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     words, lines = extract_words_and_lines(document)
-    segments = build_default_segments(lines)
-    reading_blocks = build_reading_blocks_from_segments(segments)
+    units = build_default_segments(lines)
+    reading_blocks = build_reading_blocks_from_segments(units)
+    chunks = build_tts_chunks(units)
 
-    log(f"Textdaten: words={len(words)}, lines={len(lines)}, segments={len(segments)}")
+    log(f"Textdaten: words={len(words)}, lines={len(lines)}, units={len(units)}, chunks={len(chunks)}")
 
-    return words, segments, reading_blocks
-
-
-def get_segment_by_id(metadata: dict[str, Any], segment_id: str) -> dict[str, Any]:
-    for segment in metadata.get("sentences", []):
-        if segment.get("id") == segment_id:
-            return segment
-
-    raise FileNotFoundError(f"Segment nicht gefunden: {segment_id}")
+    return words, units, reading_blocks, chunks
 
 
-def safe_audio_filename(segment_id: str) -> str:
-    cleaned = "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in segment_id)
-    return f"{cleaned}.wav"
+def ensure_chunks(metadata: dict[str, Any]) -> dict[str, Any]:
+    units = metadata.get("sentences", [])
+
+    if "chunks" not in metadata or not isinstance(metadata.get("chunks"), list):
+        metadata["chunks"] = build_tts_chunks(units)
+        metadata["updatedAt"] = now_iso()
+
+    return metadata
 
 
-def synthesize_segment_with_macos_say(
+def get_chunk_by_id(metadata: dict[str, Any], chunk_id: str) -> dict[str, Any]:
+    metadata = ensure_chunks(metadata)
+
+    for chunk in metadata.get("chunks", []):
+        if chunk.get("id") == chunk_id:
+            return chunk
+
+    raise FileNotFoundError(f"Chunk nicht gefunden: {chunk_id}")
+
+
+def get_piper_voice_dir(voice_id: str) -> Path:
+    return PIPER_VOICES_DIR / safe_id(voice_id)
+
+
+def get_piper_voice_model_path(voice_id: str) -> Path:
+    voice_dir = get_piper_voice_dir(voice_id)
+    matches = sorted(voice_dir.glob("*.onnx"))
+
+    if not matches:
+        raise FileNotFoundError(f"Kein Piper .onnx Modell gefunden für voiceId={voice_id} in {voice_dir}")
+
+    return matches[0]
+
+
+def get_piper_voice_config_path(voice_id: str, model_path: Path) -> Path:
+    direct = Path(str(model_path) + ".json")
+
+    if direct.exists():
+        return direct
+
+    voice_dir = get_piper_voice_dir(voice_id)
+    matches = sorted(voice_dir.glob("*.onnx.json"))
+
+    if not matches:
+        raise FileNotFoundError(f"Keine Piper .onnx.json Config gefunden für voiceId={voice_id} in {voice_dir}")
+
+    return matches[0]
+
+
+def list_piper_voices() -> list[dict[str, Any]]:
+    voices: list[dict[str, Any]] = []
+
+    if not PIPER_VOICES_DIR.exists():
+        return voices
+
+    for voice_dir in sorted(PIPER_VOICES_DIR.iterdir(), key=lambda path: path.name.lower()):
+        if not voice_dir.is_dir():
+            continue
+
+        onnx_files = sorted(voice_dir.glob("*.onnx"))
+        json_files = sorted(voice_dir.glob("*.onnx.json"))
+
+        if not onnx_files or not json_files:
+            continue
+
+        voice_id = voice_dir.name
+        voices.append(
+            {
+                "id": voice_id,
+                "name": voice_id.replace("_", " ").replace("-", " "),
+                "modelFilename": onnx_files[0].name,
+                "configFilename": json_files[0].name,
+                "available": True,
+                "isDefault": voice_id == DEFAULT_PIPER_VOICE_ID,
+            }
+        )
+
+    return voices
+
+
+def get_wav_duration_seconds(path: Path) -> float:
+    with wave.open(str(path), "rb") as wav_file:
+        frames = wav_file.getnframes()
+        rate = wav_file.getframerate()
+
+        if rate <= 0:
+            return 0.0
+
+        return frames / float(rate)
+
+
+def build_unit_timings(chunk: dict[str, Any], duration: float) -> list[dict[str, Any]]:
+    units = chunk.get("units", [])
+
+    if not units:
+        return []
+
+    weights = [max(1, len(normalize_spaces(str(unit.get("text", ""))))) for unit in units]
+    total_weight = max(1, sum(weights))
+
+    timings: list[dict[str, Any]] = []
+    cursor = 0.0
+
+    for unit, weight in zip(units, weights):
+        share = weight / total_weight
+        unit_duration = duration * share
+        start = cursor
+        end = min(duration, start + unit_duration)
+
+        timings.append(
+            {
+                "unitId": unit["unitId"],
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "text": unit.get("text", ""),
+                "type": unit.get("type", "text"),
+                "source": unit.get("source", "pdf_text"),
+                "pageNumber": unit.get("pageNumber"),
+                "pageNumbers": unit.get("pageNumbers", []),
+                "lineBoxes": unit.get("lineBoxes", []),
+                "wordIds": unit.get("wordIds", []),
+            }
+        )
+
+        cursor = end
+
+    if timings:
+        timings[-1]["end"] = round(duration, 3)
+
+    return timings
+
+
+def synthesize_chunk_to_file(
     document_id: str,
-    segment: dict[str, Any],
-    voice: str = "Anna",
-    rate: int = 185,
+    chunk: dict[str, Any],
+    voice_id: str,
 ) -> dict[str, Any]:
+    model_path = get_piper_voice_model_path(voice_id)
+    config_path = get_piper_voice_config_path(voice_id, model_path)
+
     document_dir = DOCUMENTS_DIR / document_id
-    audio_dir = document_dir / "audio"
+    audio_dir = document_dir / "audio" / "piper" / safe_id(voice_id) / "chunks"
     audio_dir.mkdir(parents=True, exist_ok=True)
 
-    segment_id = str(segment["id"])
-    wav_name = safe_audio_filename(segment_id)
+    chunk_id = str(chunk["id"])
+    wav_name = f"{safe_id(chunk_id)}.wav"
     wav_path = audio_dir / wav_name
-    aiff_path = audio_dir / f"{segment_id}.aiff"
 
     if wav_path.exists():
+        duration = get_wav_duration_seconds(wav_path)
         return {
-            "segmentId": segment_id,
-            "audioUrl": f"/documents/{document_id}/audio/{wav_name}",
+            "chunkId": chunk_id,
+            "voiceId": voice_id,
+            "audioUrl": f"/documents/{document_id}/audio/piper/{safe_id(voice_id)}/chunks/{wav_name}",
+            "duration": round(duration, 3),
             "cached": True,
+            "text": chunk.get("text", ""),
+            "unitIds": chunk.get("unitIds", []),
+            "units": chunk.get("units", []),
+            "unitTimings": build_unit_timings(chunk, duration),
+            "pageNumber": chunk.get("pageNumber"),
+            "pageNumbers": chunk.get("pageNumbers", []),
         }
 
-    text = normalize_spaces(str(segment.get("text", "")))
+    text = normalize_tts_text(str(chunk.get("text", "")))
 
     if not text:
-        raise ValueError(f"Segment enthält keinen Text: {segment_id}")
+        raise ValueError(f"Chunk enthält keinen Text: {chunk_id}")
 
-    say_command = [
-        "say",
-        "-v",
-        voice,
-        "-r",
-        str(rate),
-        "-o",
-        str(aiff_path),
-        text,
-    ]
+    log(f"Piper synthetisiert {chunk_id} mit {voice_id}: {text[:120]}")
 
-    convert_command = [
-        "afconvert",
+    command = [
+        *PIPER_COMMAND,
+        "-m",
+        str(model_path),
+        "-c",
+        str(config_path),
         "-f",
-        "WAVE",
-        "-d",
-        "LEI16",
-        str(aiff_path),
         str(wav_path),
     ]
 
-    subprocess.run(say_command, check=True)
-    subprocess.run(convert_command, check=True)
+    process = subprocess.run(
+        command,
+        input=text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
-    if aiff_path.exists():
-        aiff_path.unlink()
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"Piper fehlgeschlagen.\nCommand: {' '.join(command)}\nSTDOUT:\n{process.stdout}\nSTDERR:\n{process.stderr}"
+        )
+
+    duration = get_wav_duration_seconds(wav_path)
 
     return {
-        "segmentId": segment_id,
-        "audioUrl": f"/documents/{document_id}/audio/{wav_name}",
+        "chunkId": chunk_id,
+        "voiceId": voice_id,
+        "audioUrl": f"/documents/{document_id}/audio/piper/{safe_id(voice_id)}/chunks/{wav_name}",
+        "duration": round(duration, 3),
         "cached": False,
+        "text": chunk.get("text", ""),
+        "unitIds": chunk.get("unitIds", []),
+        "units": chunk.get("units", []),
+        "unitTimings": build_unit_timings(chunk, duration),
+        "pageNumber": chunk.get("pageNumber"),
+        "pageNumbers": chunk.get("pageNumbers", []),
     }
 
 
@@ -531,7 +778,7 @@ def render_pdf_to_images(
     pdf_path: Path,
     document_id: str,
     original_filename: str,
-    zoom: float = 2.0,
+    zoom: float = RENDER_ZOOM,
 ) -> dict[str, Any]:
     output_dir = DOCUMENTS_DIR / document_id
     pages_dir = output_dir / "pages"
@@ -553,7 +800,7 @@ def render_pdf_to_images(
         page_count = len(document)
         log(f"PDF hat {page_count} Seiten")
 
-        words, sentences, reading_blocks = extract_text_data(document)
+        words, units, reading_blocks, chunks = extract_text_data(document)
 
         for page_index in range(page_count):
             page_number = page_index + 1
@@ -589,8 +836,10 @@ def render_pdf_to_images(
         "updatedAt": now_iso(),
         "pages": pages,
         "words": words,
-        "sentences": sentences,
+        "sentences": units,
+        "readingUnits": units,
         "readingBlocks": reading_blocks,
+        "chunks": chunks,
     }
 
     write_metadata(document_id, metadata)
@@ -603,6 +852,16 @@ def render_pdf_to_images(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/voices")
+def get_voices() -> dict[str, Any]:
+    voices = list_piper_voices()
+
+    return {
+        "defaultVoiceId": DEFAULT_PIPER_VOICE_ID,
+        "voices": voices,
+    }
 
 
 @app.get("/api/documents")
@@ -642,7 +901,10 @@ def list_documents() -> dict[str, Any]:
 @app.get("/api/documents/{document_id}")
 def get_document(document_id: str) -> dict[str, Any]:
     try:
-        return read_metadata(document_id)
+        metadata = read_metadata(document_id)
+        metadata = ensure_chunks(metadata)
+        write_metadata(document_id, metadata)
+        return metadata
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
 
@@ -651,6 +913,7 @@ def get_document(document_id: str) -> dict[str, Any]:
 def debug_document_segments(document_id: str) -> dict[str, Any]:
     try:
         metadata = read_metadata(document_id)
+        metadata = ensure_chunks(metadata)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
 
@@ -658,29 +921,72 @@ def debug_document_segments(document_id: str) -> dict[str, Any]:
         "documentId": metadata.get("documentId"),
         "filename": metadata.get("filename"),
         "pageCount": metadata.get("pageCount"),
-        "segmentCount": len(metadata.get("sentences", [])),
-        "segments": metadata.get("sentences", []),
+        "unitCount": len(metadata.get("sentences", [])),
+        "chunkCount": len(metadata.get("chunks", [])),
+        "units": metadata.get("sentences", []),
+        "chunks": metadata.get("chunks", []),
     }
 
 
-@app.post("/api/documents/{document_id}/tts/segments/{segment_id}")
-def create_segment_audio(document_id: str, segment_id: str) -> dict[str, Any]:
+@app.post("/api/documents/{document_id}/tts/chunks/{chunk_id}")
+def create_chunk_audio(
+    document_id: str,
+    chunk_id: str,
+    voice_id: str = Query(default=DEFAULT_PIPER_VOICE_ID, alias="voiceId"),
+) -> dict[str, Any]:
     try:
         metadata = read_metadata(document_id)
-        segment = get_segment_by_id(metadata, segment_id)
+        metadata = ensure_chunks(metadata)
+        chunk = get_chunk_by_id(metadata, chunk_id)
 
-        return synthesize_segment_with_macos_say(
+        return synthesize_chunk_to_file(
             document_id=document_id,
-            segment=segment,
-            voice="Anna",
-            rate=185,
+            chunk=chunk,
+            voice_id=voice_id,
         )
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
-    except subprocess.CalledProcessError as error:
-        raise HTTPException(status_code=500, detail=f"TTS-Prozess fehlgeschlagen: {error}") from error
     except Exception as error:
-        raise HTTPException(status_code=500, detail=f"TTS konnte nicht erzeugt werden: {error}") from error
+        raise HTTPException(status_code=500, detail=f"Chunk-Audio konnte nicht erzeugt werden: {error}") from error
+
+
+@app.post("/api/documents/{document_id}/tts/preload-chunks")
+def preload_chunk_audio(
+    document_id: str,
+    payload: dict[str, Any],
+    voice_id: str = Query(default=DEFAULT_PIPER_VOICE_ID, alias="voiceId"),
+) -> dict[str, Any]:
+    chunk_ids_raw = payload.get("chunkIds", [])
+
+    if not isinstance(chunk_ids_raw, list):
+        raise HTTPException(status_code=400, detail="chunkIds muss eine Liste sein.")
+
+    chunk_ids = [str(chunk_id) for chunk_id in chunk_ids_raw]
+
+    try:
+        metadata = read_metadata(document_id)
+        metadata = ensure_chunks(metadata)
+        results: list[dict[str, Any]] = []
+
+        for chunk_id in chunk_ids:
+            chunk = get_chunk_by_id(metadata, chunk_id)
+            result = synthesize_chunk_to_file(
+                document_id=document_id,
+                chunk=chunk,
+                voice_id=voice_id,
+            )
+            results.append(result)
+
+        return {
+            "documentId": document_id,
+            "voiceId": voice_id,
+            "count": len(results),
+            "chunks": results,
+        }
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Preload fehlgeschlagen: {error}") from error
 
 
 @app.post("/api/documents/upload")
@@ -708,7 +1014,7 @@ async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
             pdf_path=temp_path,
             document_id=document_id,
             original_filename=filename,
-            zoom=2.0,
+            zoom=RENDER_ZOOM,
         )
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"PDF konnte nicht verarbeitet werden: {error}") from error
