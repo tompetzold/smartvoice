@@ -1,0 +1,7 @@
+# Optional Kokoro runtime. The app installs these automatically on first Kokoro download.
+huggingface_hub
+soundfile
+numpy
+torch
+git+https://github.com/semidark/misaki.git@6d252a2e02f3b030f22f56686f1a73786c16ffc8
+git+https://github.com/semidark/kokoro.git
