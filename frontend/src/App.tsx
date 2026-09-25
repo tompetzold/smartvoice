@@ -119,6 +119,9 @@ type DocumentSummary = {
   pageCount: number;
   createdAt: string;
   updatedAt: string;
+  previewImageUrl?: string;
+  previewWidth?: number;
+  previewHeight?: number;
 };
 
 type DocumentData = {
@@ -139,7 +142,7 @@ type DocumentData = {
 type PiperVoice = {
   id: string;
   name: string;
-  provider: "piper" | "kokoro";
+  provider: "piper" | "kokoro" | "cosyvoice";
   variantLabel: string;
   language: string;
   quality: string;
@@ -160,7 +163,7 @@ type PiperVoice = {
 };
 
 type VoiceVariant = {
-  id: "piper" | "kokoro";
+  id: "piper" | "kokoro" | "cosyvoice";
   label: string;
 };
 
@@ -227,6 +230,18 @@ type PersistedReaderState = {
 };
 
 const API_BASE_URL = "http://127.0.0.1:8001";
+
+function toApiAssetUrl(relativeUrl?: string): string {
+  if (!relativeUrl) {
+    return "";
+  }
+
+  if (relativeUrl.startsWith("http://") || relativeUrl.startsWith("https://")) {
+    return relativeUrl;
+  }
+
+  return `${API_BASE_URL}${relativeUrl}`;
+}
 const PRELOAD_CHUNK_COUNT = 4;
 const STORAGE_SELECTED_VOICE = "smartvoice:selectedVoiceId";
 const STORAGE_LAST_DOCUMENT = "smartvoice:lastDocumentId";
@@ -561,6 +576,7 @@ function App() {
   const [selectionNoteText, setSelectionNoteText] = useState("");
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const playbackRateRef = useRef(1.0);
   const viewerRef = useRef<HTMLElement | null>(null);
   const zoomRef = useRef(zoom);
   const pinchAccumulatorRef = useRef(0);
@@ -1168,11 +1184,15 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!audioRef.current) {
+    playbackRateRef.current = playbackRate;
+
+    const audio = audioRef.current;
+    if (!audio) {
       return;
     }
 
-    audioRef.current.playbackRate = playbackRate;
+    audio.defaultPlaybackRate = playbackRate;
+    audio.playbackRate = playbackRate;
   }, [playbackRate]);
 
   useEffect(() => {
@@ -1469,6 +1489,28 @@ function App() {
 
   function formatPlaybackError(error: unknown): string {
     const raw = error instanceof Error ? error.message : String(error);
+    const normalized = raw.toLowerCase();
+
+    if (normalized.includes("speichermangel") || normalized.includes("exit-code 137")) {
+      return "CosyVoice wurde wegen zu wenig Docker-Arbeitsspeicher beendet. Die Modelldaten bleiben gespeichert.";
+    }
+
+    if (normalized.includes("remote end closed connection")) {
+      return "Die Verbindung zu CosyVoice wurde während der Audioerzeugung unterbrochen.";
+    }
+
+    if (normalized.includes("nach 2 versuchen")) {
+      return "CosyVoice konnte das Audio nach 2 Versuchen nicht erzeugen.";
+    }
+
+    if (normalized.includes("noch nicht bereit") || normalized.includes("konnte nicht gestartet werden")) {
+      return "Der CosyVoice-Server ist aktuell nicht bereit.";
+    }
+
+    if (normalized.includes("keine gültige wav")) {
+      return "CosyVoice hat keine gültige Audiodatei erzeugt.";
+    }
+
     return raw.length > 220 ? `${raw.slice(0, 217)}...` : raw;
   }
 
@@ -2174,8 +2216,10 @@ function App() {
       }
 
       const safeStart = Math.max(0, Math.min(Math.max(0, data.duration - 0.01), startLocalSeconds));
+      const currentPlaybackRate = playbackRateRef.current;
       audio.currentTime = safeStart;
-      audio.playbackRate = playbackRate;
+      audio.defaultPlaybackRate = currentPlaybackRate;
+      audio.playbackRate = currentPlaybackRate;
       audio.volume = volume;
       currentChunkLocalSecondsRef.current = safeStart;
       setCurrentChunkLocalSeconds(safeStart);
@@ -2240,7 +2284,9 @@ function App() {
     }
 
     if (audioRef.current?.src && audioRef.current.currentTime > 0 && !audioRef.current.ended) {
-      audioRef.current.playbackRate = playbackRate;
+      const currentPlaybackRate = playbackRateRef.current;
+      audioRef.current.defaultPlaybackRate = currentPlaybackRate;
+      audioRef.current.playbackRate = currentPlaybackRate;
       await audioRef.current.play();
       setIsPlaying(true);
       return;
@@ -3017,10 +3063,15 @@ function App() {
   }
 
   function handlePlaybackRateChange(rate: number) {
-    setPlaybackRate(rate);
+    const nextRate = Math.max(0.5, Math.min(2.5, rate));
 
-    if (audioRef.current) {
-      audioRef.current.playbackRate = rate;
+    playbackRateRef.current = nextRate;
+    setPlaybackRate(nextRate);
+
+    const audio = audioRef.current;
+    if (audio) {
+      audio.defaultPlaybackRate = nextRate;
+      audio.playbackRate = nextRate;
     }
   }
 
@@ -3196,6 +3247,7 @@ function App() {
             {documents.length === 0 && <div className="document-list-empty">Noch keine Dateien</div>}
             {documents.map((document) => {
               const active = document.documentId === documentData?.documentId;
+              const previewSrc = toApiAssetUrl(document.previewImageUrl);
 
               return (
                 <button
@@ -3204,7 +3256,24 @@ function App() {
                   key={document.documentId}
                   onClick={() => void loadDocument(document.documentId)}
                 >
-                  <span className="document-file-icon">PDF</span>
+                  <span className="document-preview-shell">
+                    {previewSrc ? (
+                      <img
+                        className="document-preview-image"
+                        src={previewSrc}
+                        alt=""
+                        loading="lazy"
+                        onError={(event) => {
+                          event.currentTarget.style.display = "none";
+                          const fallback = event.currentTarget.nextElementSibling as HTMLElement | null;
+                          if (fallback) {
+                            fallback.style.display = "grid";
+                          }
+                        }}
+                      />
+                    ) : null}
+                    <span className="document-file-icon" style={{ display: previewSrc ? "none" : "grid" }}>PDF</span>
+                  </span>
                   <span className="document-file-name">{document.filename}</span>
                 </button>
               );
@@ -3488,6 +3557,8 @@ function App() {
                   <div className="library-history-rows">
                     {group.documents.map((document) => {
                       const progress = documentProgressPercent(document);
+                      const previewSrc = toApiAssetUrl(document.previewImageUrl);
+
                       return (
                         <button
                           type="button"
@@ -3496,7 +3567,29 @@ function App() {
                           onClick={() => void loadDocument(document.documentId)}
                         >
                           <span className="library-history-name">
-                            <span className="document-file-icon">PDF</span>
+                            <span className="library-history-preview-shell">
+                              {previewSrc ? (
+                                <img
+                                  className="library-history-preview-image"
+                                  src={previewSrc}
+                                  alt=""
+                                  loading="lazy"
+                                  onError={(event) => {
+                                    event.currentTarget.style.display = "none";
+                                    const fallback = event.currentTarget.nextElementSibling as HTMLElement | null;
+                                    if (fallback) {
+                                      fallback.style.display = "grid";
+                                    }
+                                  }}
+                                />
+                              ) : null}
+                              <span
+                                className="document-file-icon library-history-preview-fallback"
+                                style={{ display: previewSrc ? "none" : "grid" }}
+                              >
+                                PDF
+                              </span>
+                            </span>
                             <span className="library-history-filename">{document.filename}</span>
                           </span>
                           <span className="library-history-type">pdf</span>

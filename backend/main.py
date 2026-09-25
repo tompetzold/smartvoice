@@ -37,6 +37,7 @@ TARGET_CHUNK_CHARS = 1100
 HARD_MAX_CHUNK_CHARS = 1600
 WORDS_PER_MINUTE_ESTIMATE = 165.0
 CHUNKING_VERSION = 6
+PREVIEW_TARGET_WIDTH = 180
 
 TTS_ENGINE = TtsEngine(
     documents_dir=DOCUMENTS_DIR,
@@ -231,6 +232,70 @@ def write_metadata(document_id: str, metadata: dict[str, Any]) -> None:
         finally:
             if temp_path.exists():
                 temp_path.unlink()
+
+
+def preview_path(document_id: str) -> Path:
+    return DOCUMENTS_DIR / document_id / "preview.png"
+
+
+def preview_url(document_id: str) -> str:
+    return f"/documents/{document_id}/preview.png"
+
+
+def render_pdf_preview(page: fitz.Page, target_path: Path) -> tuple[int, int]:
+    rect = page.rect
+    page_width = max(1.0, float(rect.width))
+    scale = PREVIEW_TARGET_WIDTH / page_width
+    scale = max(0.18, min(scale, 1.35))
+
+    pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    pixmap.save(str(target_path))
+
+    return int(pixmap.width), int(pixmap.height)
+
+
+def ensure_document_preview(document_id: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    effective_metadata = metadata or read_metadata(document_id)
+    source_pdf = DOCUMENTS_DIR / document_id / "source.pdf"
+    target_path = preview_path(document_id)
+    target_url = preview_url(document_id)
+
+    if target_path.exists():
+        if effective_metadata.get("previewImageUrl") != target_url:
+            effective_metadata["previewImageUrl"] = target_url
+            write_metadata(document_id, effective_metadata)
+        return effective_metadata
+
+    if not source_pdf.exists():
+        return effective_metadata
+
+    lock = metadata_lock(document_id)
+
+    with lock:
+        effective_metadata = read_metadata(document_id)
+
+        if target_path.exists():
+            if effective_metadata.get("previewImageUrl") != target_url:
+                effective_metadata["previewImageUrl"] = target_url
+                write_metadata(document_id, effective_metadata)
+            return effective_metadata
+
+        document = fitz.open(str(source_pdf))
+        try:
+            if len(document) == 0:
+                return effective_metadata
+
+            width, height = render_pdf_preview(document[0], target_path)
+        finally:
+            document.close()
+
+        effective_metadata["previewImageUrl"] = target_url
+        effective_metadata["previewWidth"] = width
+        effective_metadata["previewHeight"] = height
+        effective_metadata["previewGeneratedAt"] = now_iso()
+        write_metadata(document_id, effective_metadata)
+        return effective_metadata
 
 
 HIGHLIGHT_COLORS: dict[str, tuple[float, float, float]] = {
@@ -1789,12 +1854,19 @@ def prepare_pdf_document(
     log(f"Öffne PDF: {pdf_path}")
 
     document = fitz.open(str(pdf_path))
+    preview_image_url = ""
+    preview_width = 0
+    preview_height = 0
 
     try:
         page_count = len(document)
         log(f"PDF hat {page_count} Seiten")
 
         words, units, reading_blocks, chunks = extract_text_data(document)
+
+        if page_count > 0:
+            preview_width, preview_height = render_pdf_preview(document[0], preview_path(document_id))
+            preview_image_url = preview_url(document_id)
 
         for page_index in range(page_count):
             page_number = page_index + 1
@@ -1821,6 +1893,9 @@ def prepare_pdf_document(
         "renderZoom": zoom,
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
+        "previewImageUrl": preview_image_url,
+        "previewWidth": preview_width,
+        "previewHeight": preview_height,
         "pages": pages,
         "words": words,
         "sentences": units,
@@ -1927,6 +2002,7 @@ def list_documents() -> dict[str, Any]:
 
         try:
             metadata = read_metadata(document_dir.name)
+            metadata = ensure_document_preview(document_dir.name, metadata)
 
             documents.append(
                 {
@@ -1935,6 +2011,9 @@ def list_documents() -> dict[str, Any]:
                     "pageCount": metadata["pageCount"],
                     "createdAt": metadata["createdAt"],
                     "updatedAt": metadata["updatedAt"],
+                    "previewImageUrl": metadata.get("previewImageUrl", ""),
+                    "previewWidth": metadata.get("previewWidth", 0),
+                    "previewHeight": metadata.get("previewHeight", 0),
                 }
             )
         except Exception as error:

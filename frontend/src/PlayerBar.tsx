@@ -1,5 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import thorstenImage from "./assets/thorsten.png";
+
+const PLAYBACK_RATE_STEP = 0.05;
 
 type VoiceProvider = "piper" | "kokoro";
 
@@ -73,6 +75,20 @@ function formatRemainingTime(seconds: number): string {
   }
 
   return `-${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
+}
+
+
+function formatPlaybackDuration(seconds: number): string {
+  const rounded = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const remainingSeconds = rounded % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(remainingSeconds).padStart(2, "0")}`;
+  }
+
+  return `${minutes}:${String(remainingSeconds).padStart(2, "0")}`;
 }
 
 function PlayIcon() {
@@ -241,8 +257,13 @@ export default function PlayerBar({
   const [voiceVariantOpen, setVoiceVariantOpen] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState<VoiceProvider>("piper");
   const [speedOpen, setSpeedOpen] = useState(false);
+  const [hoveredSpeedTick, setHoveredSpeedTick] = useState<number | null>(null);
   const [progressHovered, setProgressHovered] = useState(false);
   const [volumeOpen, setVolumeOpen] = useState(false);
+  const playerShellRef = useRef<HTMLElement | null>(null);
+  const voicePopoverRef = useRef<HTMLDivElement | null>(null);
+  const speedPopoverRef = useRef<HTMLDivElement | null>(null);
+  const volumePopoverRef = useRef<HTMLDivElement | null>(null);
   const canPlay = chunkCount > 0 && hasVoice && !isLoadingAudio;
   const normalizedVolume = clamp(volume, 0, 1);
   const selectedVoice = useMemo(
@@ -267,6 +288,16 @@ export default function PlayerBar({
           (estimatedTotalSeconds - currentGlobalSeconds) / Math.max(0.1, playbackRate),
         )
       : 0;
+  const estimatedPlaybackDurationSeconds =
+    estimatedTotalSeconds > 0
+      ? estimatedTotalSeconds / Math.max(0.1, playbackRate)
+      : 0;
+  const speedSliderPercent =
+    ((clamp(playbackRate, 0.5, 2.5) - 0.5) / 2) * 100;
+  const speedTickRates = useMemo(
+    () => Array.from({ length: 9 }, (_, index) => 0.5 + index * 0.25),
+    [],
+  );
   const progressTooltipPercent = clamp(
     progressPercent,
     8,
@@ -287,7 +318,12 @@ export default function PlayerBar({
   }
 
   function updateRate(nextRate: number) {
-    onPlaybackRateChange(clamp(Math.round(nextRate * 10) / 10, 0.5, 2.5));
+    const snappedRate = Math.round(nextRate / PLAYBACK_RATE_STEP) * PLAYBACK_RATE_STEP;
+    onPlaybackRateChange(clamp(Math.round(snappedRate * 100) / 100, 0.5, 2.5));
+  }
+
+  function formatPlaybackRate(rate: number): string {
+    return Number(rate.toFixed(2)).toString();
   }
 
   function openVolume() {
@@ -311,10 +347,49 @@ export default function PlayerBar({
     setSpeedOpen((open) => !open);
   }
 
+  useEffect(() => {
+    if (!voiceOpen && !speedOpen && !volumeOpen) {
+      return;
+    }
+
+    function handlePointerDown(event: PointerEvent) {
+      const target = event.target;
+
+      if (!(target instanceof Node)) {
+        return;
+      }
+
+      if (
+        playerShellRef.current?.contains(target)
+        || voicePopoverRef.current?.contains(target)
+        || speedPopoverRef.current?.contains(target)
+        || volumePopoverRef.current?.contains(target)
+      ) {
+        return;
+      }
+
+      closePopovers();
+    }
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        closePopovers();
+      }
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [voiceOpen, speedOpen, volumeOpen]);
+
   return (
     <>
       {voiceOpen && (
-        <div className="player-popover voice-popover" role="dialog" aria-label="Stimme auswählen">
+        <div ref={voicePopoverRef} className="player-popover voice-popover" role="dialog" aria-label="Stimme auswählen">
           <div className="voice-popover-header">
             <div className="voice-variant-control">
               <button
@@ -469,41 +544,127 @@ export default function PlayerBar({
       )}
 
       {speedOpen && (
-        <div className="player-popover speed-popover" role="dialog" aria-label="Lesegeschwindigkeit">
-          <div className="popover-header speed-header">
-            <div>
-              <div className="speed-title">Lesegeschwindigkeit</div>
-              <div className="speed-subtitle">{playbackRate < 0.9 ? "Langsam" : playbackRate > 1.25 ? "Schnell" : "Normal"}</div>
+        <div
+          ref={speedPopoverRef}
+          className="player-popover speed-popover speed-popover-redesign"
+          role="dialog"
+          aria-label="Lesegeschwindigkeit"
+        >
+          <button
+            className="popover-close speed-popover-close"
+            type="button"
+            onClick={() => setSpeedOpen(false)}
+            aria-label="Geschwindigkeit schließen"
+          >
+            <CloseIcon />
+          </button>
+
+          <div className="speed-redesign-layout">
+            <div className="speed-redesign-content">
+              <div className="speed-redesign-heading">
+                <strong>
+                  {playbackRate < 0.9
+                    ? "Langsam"
+                    : playbackRate > 1.25
+                      ? "Schnell"
+                      : "Normal"}
+                </strong>
+                {estimatedPlaybackDurationSeconds > 0 && (
+                  <span>
+                    Dauer ~{formatPlaybackDuration(estimatedPlaybackDurationSeconds)}
+                  </span>
+                )}
+              </div>
+
+              <div className="speed-redesign-stepper">
+                <button
+                  type="button"
+                  onClick={() => updateRate(playbackRate - PLAYBACK_RATE_STEP)}
+                  aria-label="Langsamer"
+                >
+                  <MinusIcon />
+                </button>
+
+                <strong>{formatPlaybackRate(playbackRate)}x</strong>
+
+                <button
+                  type="button"
+                  onClick={() => updateRate(playbackRate + PLAYBACK_RATE_STEP)}
+                  aria-label="Schneller"
+                >
+                  <PlusIcon />
+                </button>
+              </div>
+
+              <div className="speed-redesign-presets">
+                {[0.8, 1, 1.2].map((rate) => (
+                  <button
+                    className={Math.abs(playbackRate - rate) < 0.001 ? "active" : ""}
+                    type="button"
+                    key={rate}
+                    onClick={() => onPlaybackRateChange(rate)}
+                  >
+                    {rate}x
+                  </button>
+                ))}
+              </div>
             </div>
-            <button className="popover-close" type="button" onClick={() => setSpeedOpen(false)} aria-label="Geschwindigkeit schließen">
-              <CloseIcon />
-            </button>
+
+            <div className="speed-vertical-control">
+              <div className="speed-vertical-rail">
+                <div className="speed-vertical-ticks">
+                  {speedTickRates.map((rate, index) => {
+                    const tickPercent = ((rate - 0.5) / 2) * 100;
+                    const isActive = Math.abs(playbackRate - rate) < 0.001;
+                    const isHovered = hoveredSpeedTick === rate;
+
+                    return (
+                      <button
+                        className={`speed-vertical-tick ${isActive ? "active" : ""} ${isHovered ? "hovered" : ""}`}
+                        type="button"
+                        key={rate}
+                        style={{ bottom: `calc(${tickPercent}% - 8px)` }}
+                        onMouseEnter={() => setHoveredSpeedTick(rate)}
+                        onMouseLeave={() => setHoveredSpeedTick(null)}
+                        onFocus={() => setHoveredSpeedTick(rate)}
+                        onBlur={() => setHoveredSpeedTick(null)}
+                        onClick={() => updateRate(rate)}
+                        aria-label={`Auf ${formatPlaybackRate(rate)}x springen`}
+                        title={`${formatPlaybackRate(rate)}x`}
+                      >
+                        <span />
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div
+                  className="speed-vertical-fill"
+                  style={{ height: `${speedSliderPercent}%` }}
+                  aria-hidden="true"
+                />
+
+                <div
+                  className="speed-vertical-thumb"
+                  style={{ bottom: `calc(${speedSliderPercent}% - 13px)` }}
+                  aria-hidden="true"
+                />
+              </div>
+
+              <input
+                className="speed-vertical-input"
+                type="range"
+                min="0.5"
+                max="2.5"
+                step="0.05"
+                value={playbackRate}
+                onChange={(event) => updateRate(Number(event.target.value))}
+                aria-label={`Lesegeschwindigkeit ${formatPlaybackRate(playbackRate)}x`}
+              />
+            </div>
           </div>
 
-          <div className="speed-stepper">
-            <button type="button" onClick={() => updateRate(playbackRate - 0.1)} aria-label="Langsamer">
-              <MinusIcon />
-            </button>
-            <strong>{playbackRate.toFixed(playbackRate % 1 === 0 ? 0 : 1)}x</strong>
-            <button type="button" onClick={() => updateRate(playbackRate + 0.1)} aria-label="Schneller">
-              <PlusIcon />
-            </button>
-          </div>
-
-          <div className="speed-presets">
-            {[0.8, 1, 1.2, 1.5, 2, 2.5].map((rate) => (
-              <button
-                className={Math.abs(playbackRate - rate) < 0.01 ? "active" : ""}
-                type="button"
-                key={rate}
-                onClick={() => onPlaybackRateChange(rate)}
-              >
-                {rate}x
-              </button>
-            ))}
-          </div>
-
-          <div className="speed-setting-row">
+          <div className="speed-setting-row speed-follow-row">
             <div>
               <strong>Automatisch folgen</strong>
               <span>Dokument folgt der gesprochenen Stelle</span>
@@ -543,7 +704,7 @@ export default function PlayerBar({
         </div>
       )}
 
-      <section className="player-shell" aria-label="Audio Player">
+      <section ref={playerShellRef} className="player-shell" aria-label="Audio Player">
         {estimatedTotalSeconds > 0 && (
           <>
             <div className="player-progress-clip" aria-hidden="true">
@@ -579,7 +740,7 @@ export default function PlayerBar({
           <div className="player-left-actions">
             <div className="player-volume-control">
               {volumeOpen && (
-                <div className="volume-popover" role="dialog" aria-label="Lautstärke">
+                <div ref={volumePopoverRef} className="volume-popover" role="dialog" aria-label="Lautstärke">
                   <input
                     className="volume-slider"
                     type="range"
@@ -650,7 +811,7 @@ export default function PlayerBar({
             onClick={openSpeed}
             aria-label="Geschwindigkeit"
           >
-            {playbackRate.toFixed(playbackRate % 1 === 0 ? 0 : 1)}x
+            {formatPlaybackRate(playbackRate)}x
           </button>
 
           <button
