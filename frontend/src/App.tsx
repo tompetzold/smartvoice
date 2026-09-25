@@ -124,6 +124,51 @@ type DocumentSummary = {
   previewHeight?: number;
 };
 
+
+function readStoredSidebarDocumentOrder(): string[] {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_SIDEBAR_DOCUMENT_ORDER);
+    if (!raw) {
+      return [];
+    }
+
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((value): value is string => typeof value === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function applyStoredSidebarDocumentOrder(documents: DocumentSummary[]): DocumentSummary[] {
+  const storedOrder = readStoredSidebarDocumentOrder();
+
+  if (storedOrder.length === 0) {
+    return documents;
+  }
+
+  const byId = new Map(documents.map((document) => [document.documentId, document]));
+  const knownIds = new Set(storedOrder);
+  const newDocuments = documents.filter((document) => !knownIds.has(document.documentId));
+  const orderedDocuments = storedOrder
+    .map((documentId) => byId.get(documentId))
+    .filter((document): document is DocumentSummary => Boolean(document));
+
+  return [...newDocuments, ...orderedDocuments];
+}
+
+function persistSidebarDocumentOrder(documents: DocumentSummary[]): void {
+  try {
+    window.localStorage.setItem(
+      STORAGE_SIDEBAR_DOCUMENT_ORDER,
+      JSON.stringify(documents.map((document) => document.documentId)),
+    );
+  } catch {
+    // localStorage can be unavailable in hardened/private browser contexts.
+  }
+}
+
 type DocumentData = {
   documentId: string;
   filename: string;
@@ -249,6 +294,9 @@ const STORAGE_READER_PREFIX = "smartvoice:reader:";
 const STORAGE_UI_SETTINGS = "smartvoice:uiSettings";
 const STORAGE_BOOKMARK_PREFIX = "smartvoice:bookmarks:";
 const STORAGE_HIGHLIGHT_PREFIX = "smartvoice:highlights:";
+const STORAGE_SIDEBAR_COLLAPSED = "smartvoice:sidebarCollapsed";
+const STORAGE_SIDEBAR_DOCUMENT_ORDER = "smartvoice:sidebarDocumentOrder";
+const DOCUMENT_SWITCH_SKELETON_MIN_MS = 700;
 
 const DEFAULT_SKIP_CONTENT_SETTINGS: SkipContentSettings = {
   headings: true,
@@ -528,6 +576,25 @@ function SmartVoiceWordmark() {
   );
 }
 
+function formatSelectionNoteDate(date = new Date()): string {
+  const months = [
+    "Jan.",
+    "Feb.",
+    "Mar.",
+    "Apr.",
+    "May",
+    "Jun.",
+    "Jul.",
+    "Aug.",
+    "Sept.",
+    "Oct.",
+    "Nov.",
+    "Dec.",
+  ];
+
+  return `${months[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`;
+}
+
 function App() {
   const [documentData, setDocumentData] = useState<DocumentData | null>(null);
   const [pdfDocument, setPdfDocument] = useState<PDFDocumentProxy | null>(null);
@@ -574,6 +641,38 @@ function App() {
   const [selectionMenuPosition, setSelectionMenuPosition] = useState<SelectionMenuPosition | null>(null);
   const [selectionNoteOpen, setSelectionNoteOpen] = useState(false);
   const [selectionNoteText, setSelectionNoteText] = useState("");
+  const [selectionNoteColor, setSelectionNoteColor] = useState<TextMarkColor>("yellow");
+  const [selectionNoteColorOpen, setSelectionNoteColorOpen] = useState(false);
+  const [selectionCopied, setSelectionCopied] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem(STORAGE_SIDEBAR_COLLAPSED) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const [addDocumentDialogOpen, setAddDocumentDialogOpen] = useState(false);
+  const [draggedDocumentId, setDraggedDocumentId] = useState("");
+  const [documentDropTarget, setDocumentDropTarget] = useState<{
+    documentId: string;
+    position: "before" | "after";
+  } | null>(null);
+  const [documentDragPreviewPosition, setDocumentDragPreviewPosition] = useState<{
+    x: number;
+    y: number;
+  } | null>(null);
+  const [documentDragPreviewMetrics, setDocumentDragPreviewMetrics] = useState<{
+    offsetX: number;
+    offsetY: number;
+    width: number;
+  }>({
+    offsetX: 0,
+    offsetY: 0,
+    width: 248,
+  });
+  const [openingDocumentId, setOpeningDocumentId] = useState("");
+  const [openingDocumentFilename, setOpeningDocumentFilename] = useState("");
+  const [pdfDocumentId, setPdfDocumentId] = useState("");
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const playbackRateRef = useRef(1.0);
@@ -610,6 +709,23 @@ function App() {
   const lastPlaybackUiUpdateAtRef = useRef(0);
   const viewportPageNumberRef = useRef(1);
   const readerMenuRef = useRef<HTMLElement | null>(null);
+  const documentItemRefs = useRef<Record<string, HTMLButtonElement | null>>({});
+  const documentListRef = useRef<HTMLDivElement | null>(null);
+  const documentDropTargetRef = useRef<{
+    documentId: string;
+    position: "before" | "after";
+  } | null>(null);
+  const documentPointerDragRef = useRef<{
+    pointerId: number;
+    documentId: string;
+    startX: number;
+    startY: number;
+    dragging: boolean;
+  } | null>(null);
+  const documentLoadAbortRef = useRef<AbortController | null>(null);
+  const documentLoadRequestRef = useRef(0);
+  const openingDocumentStartedAtRef = useRef(0);
+  const suppressDocumentClickUntilRef = useRef(0);
 
   const pages = documentData?.pages ?? [];
   const chunks = documentData?.chunks ?? [];
@@ -796,6 +912,10 @@ function App() {
   }, [documentData]);
 
   useEffect(() => {
+    if (openingDocumentId) {
+      return;
+    }
+
     const viewer = viewerRef.current;
     if (!viewer || pages.length === 0 || typeof IntersectionObserver === "undefined") {
       return;
@@ -842,7 +962,7 @@ function App() {
     }
 
     return () => observer.disconnect();
-  }, [pages.length, zoom, documentData?.documentId]);
+  }, [pages.length, zoom, documentData?.documentId, openingDocumentId]);
 
   useEffect(() => {
     selectedVoiceIdRef.current = selectedVoiceId;
@@ -968,6 +1088,10 @@ function App() {
   }, [selectionDraft, selectionMenuPosition]);
 
   useEffect(() => {
+    if (openingDocumentId) {
+      return;
+    }
+
     const viewer = viewerRef.current;
 
     if (!viewer) {
@@ -1031,13 +1155,14 @@ function App() {
     return () => {
       viewer.removeEventListener("wheel", handlePinchZoom);
     };
-  }, [documentData, pages.length]);
+  }, [documentData?.documentId, pages.length, openingDocumentId]);
 
   useEffect(() => {
     const storedPdfUrl = documentData?.storedPdfUrl;
 
     if (!storedPdfUrl) {
       setPdfDocument(null);
+      setPdfDocumentId("");
       return;
     }
 
@@ -1050,6 +1175,7 @@ function App() {
     });
 
     setPdfDocument(null);
+    setPdfDocumentId("");
 
     void loadingTask.promise
       .then((pdf) => {
@@ -1059,6 +1185,7 @@ function App() {
         }
 
         setPdfDocument(pdf);
+        setPdfDocumentId(documentData?.documentId ?? "");
       })
       .catch((error: unknown) => {
         if (disposed) {
@@ -1072,11 +1199,16 @@ function App() {
     return () => {
       disposed = true;
       setPdfDocument(null);
+      setPdfDocumentId("");
       void loadingTask.destroy();
     };
   }, [documentData?.storedPdfUrl]);
 
   useEffect(() => {
+    if (openingDocumentId) {
+      return;
+    }
+
     const pending = pendingScrollRestoreRef.current;
     const currentDocumentId = documentData?.documentId;
 
@@ -1119,7 +1251,40 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [pdfDocument, documentData?.documentId]);
+  }, [pdfDocument, documentData?.documentId, openingDocumentId]);
+
+  useEffect(() => {
+    if (
+      !openingDocumentId ||
+      documentData?.documentId !== openingDocumentId ||
+      pdfDocumentId !== openingDocumentId
+    ) {
+      return;
+    }
+
+    const elapsed = performance.now() - openingDocumentStartedAtRef.current;
+    const remaining = Math.max(0, DOCUMENT_SWITCH_SKELETON_MIN_MS - elapsed);
+
+    const timeoutId = window.setTimeout(() => {
+      setOpeningDocumentId((current) => current === documentData.documentId ? "" : current);
+      setOpeningDocumentFilename("");
+    }, remaining);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [openingDocumentId, documentData?.documentId, pdfDocumentId]);
+
+  useEffect(() => {
+    if (!openingDocumentId || documentData?.documentId !== openingDocumentId) {
+      return;
+    }
+
+    const fallbackId = window.setTimeout(() => {
+      setOpeningDocumentId((current) => current === documentData.documentId ? "" : current);
+      setOpeningDocumentFilename("");
+    }, 6000);
+
+    return () => window.clearTimeout(fallbackId);
+  }, [openingDocumentId, documentData?.documentId]);
 
   useEffect(() => {
     let disposed = false;
@@ -1775,8 +1940,9 @@ function App() {
       }
 
       const data = (await response.json()) as { documents: DocumentSummary[] };
-      setDocuments(data.documents);
-      return data.documents;
+      const orderedDocuments = applyStoredSidebarDocumentOrder(data.documents);
+      setDocuments(orderedDocuments);
+      return orderedDocuments;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setStatus(`Fehler beim Laden gespeicherter PDFs: ${message}`);
@@ -1784,7 +1950,260 @@ function App() {
     }
   }
 
+  function updateDocumentDragPreview(clientX: number, clientY: number) {
+    if (clientX <= 0 || clientY <= 0) {
+      return;
+    }
+
+    setDocumentDragPreviewPosition((current) => {
+      if (
+        current &&
+        Math.abs(current.x - clientX) < 2 &&
+        Math.abs(current.y - clientY) < 2
+      ) {
+        return current;
+      }
+
+      return {
+        x: clientX,
+        y: clientY,
+      };
+    });
+  }
+
+  function resetDocumentPointerDrag() {
+    documentPointerDragRef.current = null;
+    documentDropTargetRef.current = null;
+    setDraggedDocumentId("");
+    setDocumentDropTarget(null);
+    setDocumentDragPreviewPosition(null);
+  }
+
+  function updateDocumentPointerDropTarget(
+    draggedId: string,
+    clientX: number,
+    clientY: number,
+  ) {
+    const hitElement = window.document.elementFromPoint(clientX, clientY);
+    const targetElement = hitElement?.closest<HTMLElement>(
+      ".document-list-item[data-document-id]",
+    );
+
+    if (targetElement) {
+      const targetId = targetElement.dataset.documentId ?? "";
+
+      if (!targetId || targetId === draggedId) {
+        return;
+      }
+
+      const targetRect = targetElement.getBoundingClientRect();
+      const position: "before" | "after" =
+        clientY < targetRect.top + targetRect.height / 2
+          ? "before"
+          : "after";
+
+      const currentTarget = documentDropTargetRef.current;
+
+      if (
+        currentTarget?.documentId === targetId &&
+        currentTarget.position === position
+      ) {
+        return;
+      }
+
+      const nextTarget = {
+        documentId: targetId,
+        position,
+      } as const;
+
+      documentDropTargetRef.current = nextTarget;
+      setDocumentDropTarget(nextTarget);
+      reorderSidebarDocument(draggedId, targetId, position);
+      return;
+    }
+
+    const list = documentListRef.current;
+
+    if (!list || documents.length === 0) {
+      return;
+    }
+
+    const listRect = list.getBoundingClientRect();
+
+    if (
+      clientX < listRect.left ||
+      clientX > listRect.right ||
+      clientY < listRect.top - 16 ||
+      clientY > listRect.bottom + 48
+    ) {
+      return;
+    }
+
+    const firstDocument = documents[0];
+    const lastDocument = documents[documents.length - 1];
+
+    const firstElement = firstDocument
+      ? documentItemRefs.current[firstDocument.documentId]
+      : null;
+    const lastElement = lastDocument
+      ? documentItemRefs.current[lastDocument.documentId]
+      : null;
+
+    if (
+      firstDocument &&
+      firstElement &&
+      firstDocument.documentId !== draggedId &&
+      clientY < firstElement.getBoundingClientRect().top
+    ) {
+      const nextTarget = {
+        documentId: firstDocument.documentId,
+        position: "before",
+      } as const;
+
+      const currentTarget = documentDropTargetRef.current;
+
+      if (
+        currentTarget?.documentId !== nextTarget.documentId ||
+        currentTarget.position !== nextTarget.position
+      ) {
+        documentDropTargetRef.current = nextTarget;
+        setDocumentDropTarget(nextTarget);
+        reorderSidebarDocument(
+          draggedId,
+          nextTarget.documentId,
+          nextTarget.position,
+        );
+      }
+
+      return;
+    }
+
+    if (
+      lastDocument &&
+      lastElement &&
+      lastDocument.documentId !== draggedId &&
+      clientY > lastElement.getBoundingClientRect().bottom
+    ) {
+      const nextTarget = {
+        documentId: lastDocument.documentId,
+        position: "after",
+      } as const;
+
+      const currentTarget = documentDropTargetRef.current;
+
+      if (
+        currentTarget?.documentId !== nextTarget.documentId ||
+        currentTarget.position !== nextTarget.position
+      ) {
+        documentDropTargetRef.current = nextTarget;
+        setDocumentDropTarget(nextTarget);
+        reorderSidebarDocument(
+          draggedId,
+          nextTarget.documentId,
+          nextTarget.position,
+        );
+      }
+    }
+  }
+
+  function reorderSidebarDocument(
+    draggedId: string,
+    targetId: string,
+    position: "before" | "after",
+  ) {
+    if (!draggedId || !targetId || draggedId === targetId) {
+      return;
+    }
+
+    const beforePositions = new Map<string, DOMRect>();
+
+    for (const document of documents) {
+      const element = documentItemRefs.current[document.documentId];
+      if (element) {
+        beforePositions.set(document.documentId, element.getBoundingClientRect());
+      }
+    }
+
+    setDocuments((currentDocuments) => {
+      const draggedIndex = currentDocuments.findIndex((document) => document.documentId === draggedId);
+      const targetIndex = currentDocuments.findIndex((document) => document.documentId === targetId);
+
+      if (draggedIndex < 0 || targetIndex < 0 || draggedIndex === targetIndex) {
+        return currentDocuments;
+      }
+
+      const nextDocuments = [...currentDocuments];
+      const [draggedDocument] = nextDocuments.splice(draggedIndex, 1);
+
+      const targetIndexAfterRemoval = nextDocuments.findIndex(
+        (document) => document.documentId === targetId,
+      );
+
+      if (targetIndexAfterRemoval < 0) {
+        return currentDocuments;
+      }
+
+      const insertionIndex =
+        position === "after"
+          ? targetIndexAfterRemoval + 1
+          : targetIndexAfterRemoval;
+
+      nextDocuments.splice(insertionIndex, 0, draggedDocument);
+      persistSidebarDocumentOrder(nextDocuments);
+
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          for (const document of nextDocuments) {
+            if (document.documentId === draggedId) {
+              continue;
+            }
+
+            const element = documentItemRefs.current[document.documentId];
+            const before = beforePositions.get(document.documentId);
+
+            if (!element || !before) {
+              continue;
+            }
+
+            const after = element.getBoundingClientRect();
+            const deltaY = before.top - after.top;
+
+            if (Math.abs(deltaY) < 1) {
+              continue;
+            }
+
+            element.animate(
+              [
+                { transform: `translateY(${deltaY}px)` },
+                { transform: "translateY(0)" },
+              ],
+              {
+                duration: 180,
+                easing: "cubic-bezier(0.22, 1, 0.36, 1)",
+              },
+            );
+          }
+        });
+      });
+
+      return nextDocuments;
+    });
+  }
+
   async function loadDocument(documentId: string) {
+    if (!documentId) {
+      return;
+    }
+
+    if (
+      documentId === documentDataRef.current?.documentId &&
+      !openingDocumentId
+    ) {
+      return;
+    }
+
+    const selectedDocument = documents.find((document) => document.documentId === documentId);
+
     persistCurrentReaderState();
     rotateGenerationSession();
     stopPlayback();
@@ -1794,18 +2213,41 @@ function App() {
     setSelectedUnitId("");
     activeWordIdRef.current = "";
     setActiveWordTiming(null);
+    clearTextSelection();
+    closeMenus();
+    pageRefs.current = {};
 
+    documentLoadAbortRef.current?.abort();
+    const controller = new AbortController();
+    documentLoadAbortRef.current = controller;
+
+    const requestId = documentLoadRequestRef.current + 1;
+    documentLoadRequestRef.current = requestId;
+    openingDocumentStartedAtRef.current = performance.now();
+
+    setOpeningDocumentId(documentId);
+    setOpeningDocumentFilename(selectedDocument?.filename ?? "Dokument");
     setIsUploading(true);
-    setStatus(`Öffne ${documentId} ...`);
+    setStatus(`Öffne ${selectedDocument?.filename ?? documentId} ...`);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/api/documents/${documentId}`);
+      const response = await fetch(`${API_BASE_URL}/api/documents/${documentId}`, {
+        signal: controller.signal,
+      });
 
       if (!response.ok) {
         throw new Error(await response.text());
       }
 
       const data = (await response.json()) as DocumentData;
+
+      if (
+        controller.signal.aborted ||
+        requestId !== documentLoadRequestRef.current
+      ) {
+        return;
+      }
+
       const persisted = readStoredReaderState(data.documentId);
       const dataChunks = data.chunks ?? [];
       const restoredChunkIndex = persisted
@@ -1861,12 +2303,23 @@ function App() {
       nextUrl.searchParams.set("document", data.documentId);
       window.history.replaceState({}, "", nextUrl);
       setStatus(`Geladen: ${data.filename} | Seiten: ${data.pageCount} | Chunks: ${data.chunks?.length ?? 0}`);
-
     } catch (error) {
+      if (controller.signal.aborted || requestId !== documentLoadRequestRef.current) {
+        return;
+      }
+
       const message = error instanceof Error ? error.message : String(error);
+      setOpeningDocumentId("");
+      setOpeningDocumentFilename("");
       setStatus(`Fehler: ${message}`);
     } finally {
-      setIsUploading(false);
+      if (requestId === documentLoadRequestRef.current) {
+        setIsUploading(false);
+      }
+
+      if (documentLoadAbortRef.current === controller) {
+        documentLoadAbortRef.current = null;
+      }
     }
   }
 
@@ -2407,12 +2860,17 @@ function App() {
   }
 
   function closeCurrentDocument() {
-    const currentDocument = documentDataRef.current;
-    if (!currentDocument) {
-      return;
-    }
+    documentLoadAbortRef.current?.abort();
+    documentLoadAbortRef.current = null;
+    documentLoadRequestRef.current += 1;
+    setOpeningDocumentId("");
+    setOpeningDocumentFilename("");
 
-    persistCurrentReaderState();
+    const currentDocument = documentDataRef.current;
+
+    if (currentDocument) {
+      persistCurrentReaderState();
+    }
     rotateGenerationSession();
     stopPlayback();
     clearReadingPlaybackHighlight();
@@ -2534,6 +2992,9 @@ function App() {
     setSelectionMenuPosition(null);
     setSelectionNoteOpen(false);
     setSelectionNoteText("");
+    setSelectionNoteColor("yellow");
+    setSelectionNoteColorOpen(false);
+    setSelectionCopied(false);
   }
 
   function selectedTextFromWords(words: PdfWord[]) {
@@ -2606,6 +3067,11 @@ function App() {
   }
 
   function updateHoverFromWord(word: PdfWord | null) {
+    if (!playerVisible || !clickToReadEnabled) {
+      setHoveredUnitId((current) => current ? "" : current);
+      return;
+    }
+
     const unitId = word ? wordToUnitId.get(word.id) ?? "" : "";
     setHoveredUnitId((current) => current === unitId ? current : unitId);
   }
@@ -2634,6 +3100,8 @@ function App() {
     setSelectionMenuPosition(null);
     setSelectionNoteOpen(false);
     setSelectionNoteText("");
+    setSelectionNoteColor("yellow");
+    setSelectionCopied(false);
     updateHoverFromWord(word);
   }
 
@@ -2691,9 +3159,11 @@ function App() {
       clearTextSelection();
       const word = wordById.get(focusWordId);
       const unitId = word ? wordToUnitId.get(word.id) : "";
-      if (clickToReadEnabled && unitId) {
+
+      if (playerVisible && clickToReadEnabled && unitId) {
         seekToUnit(unitId);
       }
+
       return;
     }
 
@@ -2754,8 +3224,17 @@ function App() {
       return;
     }
 
-    await navigator.clipboard.writeText(draft.text);
-    setStatus("Ausgewählter Text kopiert.");
+    try {
+      await navigator.clipboard.writeText(draft.text);
+      setSelectionCopied(true);
+      setStatus("Ausgewählter Text kopiert.");
+
+      window.setTimeout(() => {
+        clearTextSelection();
+      }, 850);
+    } catch {
+      setStatus("Kopieren fehlgeschlagen.");
+    }
   }
 
   function saveSelectionNote() {
@@ -2763,7 +3242,7 @@ function App() {
     if (!note) {
       return;
     }
-    addSelectionHighlight("yellow", note);
+    addSelectionHighlight(selectionNoteColor, note);
   }
 
   function goToTextHighlight(highlight: TextHighlight) {
@@ -3009,10 +3488,38 @@ function App() {
     const file = event.target.files?.[0];
 
     if (file) {
+      setAddDocumentDialogOpen(false);
       void uploadPdf(file);
     }
 
     event.target.value = "";
+  }
+
+  function handleAddDocumentDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    setIsDragging(false);
+
+    const file = event.dataTransfer.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    setAddDocumentDialogOpen(false);
+    void uploadPdf(file);
+  }
+
+  function showLibraryHome() {
+    setAddDocumentDialogOpen(false);
+
+    if (documentDataRef.current) {
+      closeCurrentDocument();
+      return;
+    }
+
+    closeMenus();
+    setReaderDialog(null);
+    clearTextSelection();
+    setStatus("Bibliothek");
   }
 
   function handleDragOver(event: DragEvent<HTMLDivElement>) {
@@ -3133,7 +3640,7 @@ function App() {
     const sentenceHighlights = pageUnits.flatMap((unit) => {
       const active = playerVisible && sentenceHighlightEnabled && isPlaying && unit.unitId === activeId;
       const selected = playerVisible && sentenceHighlightEnabled && unit.unitId === selectedUnitId;
-      const hovered = unit.unitId === hoveredUnitId;
+      const hovered = playerVisible && clickToReadEnabled && unit.unitId === hoveredUnitId;
       const rects = unit.lineRects?.filter((rect) => rect.pageNumber === page.pageNumber) ?? [];
 
       const effectiveRects = rects.length > 0
@@ -3215,26 +3722,60 @@ function App() {
     );
   }
 
+  useEffect(() => {
+    if (!playerVisible || !clickToReadEnabled) {
+      setHoveredUnitId("");
+    }
+  }, [playerVisible, clickToReadEnabled]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORAGE_SIDEBAR_COLLAPSED, sidebarCollapsed ? "1" : "0");
+    } catch {
+      // localStorage can be unavailable in hardened/private browser contexts.
+    }
+  }, [sidebarCollapsed]);
+
+  useEffect(() => {
+    if (!addDocumentDialogOpen) {
+      return;
+    }
+
+    function handleAddDocumentDialogKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setAddDocumentDialogOpen(false);
+      }
+    }
+
+    document.addEventListener("keydown", handleAddDocumentDialogKeyDown);
+    return () => document.removeEventListener("keydown", handleAddDocumentDialogKeyDown);
+  }, [addDocumentDialogOpen]);
+
   const appliedTheme: "light" | "dark" = themeMode === "system" ? (systemPrefersDark ? "dark" : "light") : themeMode;
 
   return (
-    <main className={`app-shell theme-${appliedTheme} cursor-color-${cursorColor}`}>
+    <main className={`app-shell theme-${appliedTheme} cursor-color-${cursorColor} ${sidebarCollapsed ? "sidebar-collapsed" : "sidebar-expanded"}`}>
       <audio ref={audioRef} />
 
       <aside className="library-sidebar">
         <div className="brand-row">
           <img className="brand-logo" src="/smartvoice-logo.webp" alt="SmartVoice" />
-          <SmartVoiceWordmark />
+          <span className="brand-wordmark-wrap">
+            <SmartVoiceWordmark />
+          </span>
         </div>
 
-        <label className="add-document-button">
+        <button
+          className="add-document-button"
+          type="button"
+          disabled={isUploading}
+          onClick={() => setAddDocumentDialogOpen(true)}
+        >
           <span className="add-document-icon">＋</span>
           <span>Hinzufügen</span>
-          <input type="file" accept="application/pdf,.pdf" onChange={handleFileInput} />
-        </label>
+        </button>
 
         <nav className="library-nav" aria-label="Dokumente">
-          <div className="library-section-title">Bibliothek</div>
           <div className="library-search-placeholder">
             <svg viewBox="0 0 20 20" aria-hidden="true">
               <circle cx="8.5" cy="8.5" r="5.2" fill="none" stroke="currentColor" strokeWidth="1.5" />
@@ -3243,18 +3784,121 @@ function App() {
             <span>Suchen</span>
           </div>
 
-          <div className="document-list">
+          <div
+            ref={documentListRef}
+            className="document-list"
+          >
             {documents.length === 0 && <div className="document-list-empty">Noch keine Dateien</div>}
             {documents.map((document) => {
-              const active = document.documentId === documentData?.documentId;
+              const activeDocumentId = openingDocumentId || documentData?.documentId || "";
+              const active = document.documentId === activeDocumentId;
               const previewSrc = toApiAssetUrl(document.previewImageUrl);
+              const dragging = draggedDocumentId === document.documentId;
 
               return (
                 <button
-                  className={`document-list-item ${active ? "active" : ""}`}
+                  ref={(element) => {
+                    documentItemRefs.current[document.documentId] = element;
+                  }}
+                  data-document-id={document.documentId}
+                  className={`document-list-item ${active ? "active" : ""} ${dragging ? "dragging" : ""}`}
                   type="button"
                   key={document.documentId}
-                  onClick={() => void loadDocument(document.documentId)}
+                  onClick={() => {
+                    if (performance.now() < suppressDocumentClickUntilRef.current) {
+                      return;
+                    }
+
+                    void loadDocument(document.documentId);
+                  }}
+                  onPointerDown={(event) => {
+                    if (
+                      event.button !== 0 ||
+                      (event.pointerType === "touch" && !event.isPrimary)
+                    ) {
+                      return;
+                    }
+
+                    const sourceRect = event.currentTarget.getBoundingClientRect();
+
+                    documentPointerDragRef.current = {
+                      pointerId: event.pointerId,
+                      documentId: document.documentId,
+                      startX: event.clientX,
+                      startY: event.clientY,
+                      dragging: false,
+                    };
+
+                    documentDropTargetRef.current = null;
+                    setDocumentDropTarget(null);
+                    setDocumentDragPreviewMetrics({
+                      offsetX: event.clientX - sourceRect.left,
+                      offsetY: event.clientY - sourceRect.top,
+                      width: sourceRect.width,
+                    });
+
+                    event.currentTarget.setPointerCapture(event.pointerId);
+                  }}
+                  onPointerMove={(event) => {
+                    const drag = documentPointerDragRef.current;
+
+                    if (!drag || drag.pointerId !== event.pointerId) {
+                      return;
+                    }
+
+                    const deltaX = event.clientX - drag.startX;
+                    const deltaY = event.clientY - drag.startY;
+
+                    if (!drag.dragging) {
+                      if (Math.hypot(deltaX, deltaY) < 5) {
+                        return;
+                      }
+
+                      drag.dragging = true;
+                      setDraggedDocumentId(drag.documentId);
+                    }
+
+                    event.preventDefault();
+                    updateDocumentDragPreview(event.clientX, event.clientY);
+                    updateDocumentPointerDropTarget(
+                      drag.documentId,
+                      event.clientX,
+                      event.clientY,
+                    );
+                  }}
+                  onPointerUp={(event) => {
+                    const drag = documentPointerDragRef.current;
+
+                    if (!drag || drag.pointerId !== event.pointerId) {
+                      return;
+                    }
+
+                    if (drag.dragging) {
+                      event.preventDefault();
+                      suppressDocumentClickUntilRef.current = performance.now() + 300;
+                    }
+
+                    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                      event.currentTarget.releasePointerCapture(event.pointerId);
+                    }
+
+                    resetDocumentPointerDrag();
+                  }}
+                  onPointerCancel={(event) => {
+                    const drag = documentPointerDragRef.current;
+
+                    if (!drag || drag.pointerId !== event.pointerId) {
+                      return;
+                    }
+
+                    suppressDocumentClickUntilRef.current = performance.now() + 300;
+
+                    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                      event.currentTarget.releasePointerCapture(event.pointerId);
+                    }
+
+                    resetDocumentPointerDrag();
+                  }}
                 >
                   <span className="document-preview-shell">
                     {previewSrc ? (
@@ -3263,6 +3907,7 @@ function App() {
                         src={previewSrc}
                         alt=""
                         loading="lazy"
+                        draggable={false}
                         onError={(event) => {
                           event.currentTarget.style.display = "none";
                           const fallback = event.currentTarget.nextElementSibling as HTMLElement | null;
@@ -3280,13 +3925,78 @@ function App() {
             })}
           </div>
         </nav>
+
+        <nav className="sidebar-compact-actions" aria-label="Schnellzugriff">
+          <button
+            type="button"
+            className="sidebar-compact-button"
+            disabled={isUploading}
+            onClick={() => setAddDocumentDialogOpen(true)}
+            aria-label="Dokument hinzufügen"
+            title="Hinzufügen"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" />
+            </svg>
+          </button>
+
+          <button
+            type="button"
+            className={`sidebar-compact-button ${!documentData ? "active" : ""}`}
+            onClick={showLibraryHome}
+            aria-label="Bibliothek öffnen"
+            title="Bibliothek"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="5" y="4.5" width="11" height="13" rx="2" />
+              <rect x="8" y="7.5" width="11" height="12" rx="2" />
+            </svg>
+          </button>
+        </nav>
+
+        <button
+          type="button"
+          className="sidebar-collapse-handle"
+          onPointerMove={(event) => {
+            const rect = event.currentTarget.getBoundingClientRect();
+
+            const relativeX = Math.max(
+              0,
+              Math.min(event.clientX - rect.left, rect.width),
+            );
+
+            const relativeY = Math.max(
+              24,
+              Math.min(event.clientY - rect.top, rect.height - 24),
+            );
+
+            event.currentTarget.style.setProperty("--sidebar-handle-x", `${relativeX}px`);
+            event.currentTarget.style.setProperty("--sidebar-handle-y", `${relativeY}px`);
+          }}
+          onClick={() => setSidebarCollapsed((current) => !current)}
+          aria-label={sidebarCollapsed ? "Sidebar ausklappen" : "Sidebar einklappen"}
+          aria-expanded={!sidebarCollapsed}
+        >
+          <span className="sidebar-collapse-grip" aria-hidden="true">
+            <svg viewBox="0 0 28 22">
+              <path
+                className={`sidebar-direction-arrow left ${!sidebarCollapsed ? "available" : ""}`}
+                d="M11.2 5.2 5.8 11l5.4 5.8Z"
+              />
+              <path
+                className={`sidebar-direction-arrow right ${sidebarCollapsed ? "available" : ""}`}
+                d="m16.8 5.2 5.4 5.8-5.4 5.8Z"
+              />
+            </svg>
+          </span>
+        </button>
       </aside>
 
       <section className="reader-shell">
         <header className="reader-topbar">
           <div className="reader-title-group">
-            <strong>{documentData?.filename ?? "Bibliothek"}</strong>
-            {documentData && (
+            <strong>{openingDocumentFilename || documentData?.filename || "Bibliothek"}</strong>
+            {documentData && !openingDocumentId && (
               <nav className="reader-menu" aria-label="Dokumentmenü" ref={readerMenuRef}>
                 <div className="reader-menu-item-wrap">
                   <button
@@ -3432,13 +4142,13 @@ function App() {
           </div>
 
           <div className="reader-topbar-actions">
-            {showStatusInformation && (documentData || isUploading) && (
+            {showStatusInformation && (documentData || isUploading || openingDocumentId) && (
               <div className="reader-status">
-                <span className={isUploading || isLoadingAudio ? "status-spinner" : "status-dot"} />
+                <span className={isUploading || isLoadingAudio || openingDocumentId ? "status-spinner" : "status-dot"} />
                 <span>{status}</span>
               </div>
             )}
-            {documentData && (
+            {(documentData || openingDocumentId) && (
               <button
                 type="button"
                 className="reader-document-close"
@@ -3452,7 +4162,29 @@ function App() {
           </div>
         </header>
 
-        {documentData ? (
+        {openingDocumentId ? (
+          <section className="viewer document-switch-loading" aria-label="Dokument wird geöffnet">
+            {[0, 1].map((pageIndex) => (
+              <article className="document-switch-skeleton-page" key={pageIndex} aria-hidden="true">
+                <div className="document-switch-skeleton-content">
+                  <span className="document-switch-skeleton-heading" />
+                  <span className="document-switch-skeleton-line wide" />
+                  <span className="document-switch-skeleton-line wide" />
+                  <span className="document-switch-skeleton-line medium" />
+                  <span className="document-switch-skeleton-gap" />
+                  <span className="document-switch-skeleton-line wide" />
+                  <span className="document-switch-skeleton-line wide" />
+                  <span className="document-switch-skeleton-line short" />
+                  <span className="document-switch-skeleton-gap small" />
+                  <span className="document-switch-skeleton-line wide" />
+                  <span className="document-switch-skeleton-line medium" />
+                  <span className="document-switch-skeleton-line wide" />
+                  <span className="document-switch-skeleton-line short" />
+                </div>
+              </article>
+            ))}
+          </section>
+        ) : documentData ? (
           <section
             className={`viewer ${isDragging ? "dragging" : ""}`}
             ref={viewerRef}
@@ -3481,13 +4213,20 @@ function App() {
             )}
   
             {pages.map((page) => {
-              const inRenderWindow = Math.abs(page.pageNumber - viewportPageNumber) <= 3;
+              const renderRadius =
+                zoom >= 1.5
+                  ? 1
+                  : zoom >= 1
+                    ? 2
+                    : 3;
+              const inRenderWindow =
+                Math.abs(page.pageNumber - viewportPageNumber) <= renderRadius;
   
               return (
                 <article
                   className="page-card"
                   data-page-number={page.pageNumber}
-                  key={page.pageNumber}
+                  key={`${documentData.documentId}:${page.pageNumber}`}
                   ref={(element) => {
                     pageRefs.current[page.pageNumber] = element;
                   }}
@@ -3612,6 +4351,60 @@ function App() {
         )}
       </section>
 
+      {addDocumentDialogOpen && (
+        <div
+          className="add-document-dialog-backdrop"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setAddDocumentDialogOpen(false);
+            }
+          }}
+          onDragOver={(event) => {
+            event.preventDefault();
+            setIsDragging(true);
+          }}
+          onDragLeave={(event) => {
+            event.preventDefault();
+            setIsDragging(false);
+          }}
+          onDrop={handleAddDocumentDrop}
+        >
+          <section
+            className={`add-document-dialog ${isDragging ? "dragging" : ""}`}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Dokument hinzufügen"
+          >
+            <div className="add-document-dialog-header">
+              <div>
+                <h2>Dokument hinzufügen</h2>
+                <p>PDF auswählen oder hier hineinziehen.</p>
+              </div>
+              <button
+                type="button"
+                className="add-document-dialog-close"
+                onClick={() => setAddDocumentDialogOpen(false)}
+                aria-label="Dialog schließen"
+              >
+                ×
+              </button>
+            </div>
+
+            <label className="add-document-dropzone">
+              <span className="add-document-dropzone-icon">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 15V4M8 8l4-4 4 4" />
+                  <path d="M5 13v5.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V13" />
+                </svg>
+              </span>
+              <strong>PDF auswählen</strong>
+              <span>oder Datei per Drag & Drop hinzufügen</span>
+              <input type="file" accept="application/pdf,.pdf" onChange={handleFileInput} />
+            </label>
+          </section>
+        </div>
+      )}
+
       {readerDialog && (
         <div className="reader-dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setReaderDialog(null); }}>
           <section className={`reader-dialog ${readerDialog === "skip-content" ? "skip-content-dialog" : ""}`} role="dialog" aria-modal="true">
@@ -3731,13 +4524,62 @@ function App() {
         </div>
       )}
 
+      {draggedDocumentId && documentDragPreviewPosition && (() => {
+        const draggedDocument = documents.find(
+          (document) => document.documentId === draggedDocumentId,
+        );
+
+        if (!draggedDocument) {
+          return null;
+        }
+
+        const previewSrc = toApiAssetUrl(draggedDocument.previewImageUrl);
+
+        return (
+          <div
+            className="document-drag-preview"
+            style={{
+              left: `${documentDragPreviewPosition.x - documentDragPreviewMetrics.offsetX}px`,
+              top: `${documentDragPreviewPosition.y - documentDragPreviewMetrics.offsetY}px`,
+              width: `${documentDragPreviewMetrics.width}px`,
+            }}
+            aria-hidden="true"
+          >
+            <span className="document-drag-preview-image-shell">
+              {previewSrc ? (
+                <img
+                  className="document-drag-preview-image"
+                  src={previewSrc}
+                  alt=""
+                  draggable={false}
+                />
+              ) : (
+                <span className="document-drag-preview-file-icon">PDF</span>
+              )}
+            </span>
+
+            <span className="document-drag-preview-filename">
+              {draggedDocument.filename}
+            </span>
+          </div>
+        );
+      })()}
+
       {selectionDraft && selectionMenuPosition && (
         <div
-          className={`text-selection-toolbar ${selectionNoteOpen ? "note-open" : ""}`}
+          className={`text-selection-toolbar ${selectionNoteOpen ? "note-open" : ""} ${selectionCopied ? "copy-confirmed" : ""}`}
           style={{ left: `${selectionMenuPosition.left}px`, top: `${selectionMenuPosition.top}px` }}
           onPointerDown={(event) => event.stopPropagation()}
         >
-          {!selectionNoteOpen ? (
+          {selectionCopied ? (
+            <div className="selection-copy-confirmation" role="status" aria-live="polite">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="4.5" y="7.5" width="11" height="11" rx="1.8" />
+                <rect x="8.5" y="3.5" width="11" height="11" rx="1.8" />
+              </svg>
+              <span>Kopiert</span>
+            </div>
+          ) : !selectionNoteOpen ? (
             <>
               <div className="selection-color-row" aria-label="Markierungsfarbe">
                 {(["yellow", "green", "pink", "purple", "blue"] as TextMarkColor[]).map((color) => (
@@ -3752,26 +4594,120 @@ function App() {
               </div>
               <div className="selection-toolbar-divider" />
               <button type="button" className="selection-toolbar-action" onClick={() => void copySelectionText()}>
-                <span className="selection-toolbar-icon">▣</span>
+                <span className="selection-toolbar-icon selection-copy-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24">
+                    <rect x="4.5" y="7.5" width="11" height="11" rx="1.8" />
+                    <rect x="8.5" y="3.5" width="11" height="11" rx="1.8" />
+                  </svg>
+                </span>
                 <span>Kopieren</span>
               </button>
-              <button type="button" className="selection-toolbar-action" onClick={() => setSelectionNoteOpen(true)}>
+              <button
+                type="button"
+                className="selection-toolbar-action"
+                onClick={() => {
+                  setSelectionNoteColor("yellow");
+                  setSelectionNoteColorOpen(false);
+                  setSelectionNoteOpen(true);
+                }}
+              >
                 <span className="selection-toolbar-icon">✎</span>
                 <span>Notiz hinzufügen</span>
               </button>
             </>
           ) : (
-            <div className="selection-note-editor">
-              <strong>Notiz hinzufügen</strong>
-              <textarea
-                autoFocus
-                value={selectionNoteText}
-                onChange={(event) => setSelectionNoteText(event.target.value)}
-                placeholder="Notiz zum markierten Text …"
-              />
+            <div className="selection-note-editor selection-note-editor-dropdown">
+              <div className="selection-note-spechify-header">
+                <strong>{formatSelectionNoteDate()}</strong>
+
+                <div className="selection-note-header-actions">
+                  <div className="selection-note-color-control">
+                    <button
+                      type="button"
+                      className={`selection-note-color-trigger ${selectionNoteColorOpen ? "open" : ""}`}
+                      onClick={() => setSelectionNoteColorOpen((open) => !open)}
+                      aria-label="Notizfarbe auswählen"
+                      aria-expanded={selectionNoteColorOpen}
+                    >
+                      <span className={`selection-note-trigger-dot ${selectionNoteColor}`} />
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path d={selectionNoteColorOpen ? "M7 14l5-5 5 5" : "M7 10l5 5 5-5"} />
+                      </svg>
+                    </button>
+
+                    {selectionNoteColorOpen && (
+                      <div className="selection-note-color-dropdown" role="menu" aria-label="Notizfarbe">
+                        {(["yellow", "green", "pink", "purple", "blue"] as TextMarkColor[]).map((color) => (
+                          <button
+                            type="button"
+                            className={`selection-note-dropdown-color ${color} ${selectionNoteColor === color ? "active" : ""}`}
+                            key={color}
+                            onClick={() => {
+                              setSelectionNoteColor(color);
+                              setSelectionNoteColorOpen(false);
+                            }}
+                            aria-label={`Notizfarbe ${color}`}
+                            aria-pressed={selectionNoteColor === color}
+                            role="menuitemradio"
+                          >
+                            {selectionNoteColor === color && (
+                              <svg viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M6.5 12.5l3.4 3.4 7.6-8" />
+                              </svg>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    className="selection-note-close"
+                    onClick={() => {
+                      setSelectionNoteOpen(false);
+                      setSelectionNoteText("");
+                      setSelectionNoteColor("yellow");
+                      setSelectionNoteColorOpen(false);
+                    }}
+                    aria-label="Notiz schließen"
+                  >
+                    <svg viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M6 6l12 12M18 6L6 18" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+
+              <div className="selection-note-textarea-wrap">
+                <textarea
+                  autoFocus
+                  value={selectionNoteText}
+                  onChange={(event) => setSelectionNoteText(event.target.value)}
+                  placeholder="Text eingeben..."
+                />
+              </div>
+
               <div className="selection-note-actions">
-                <button type="button" onClick={() => { setSelectionNoteOpen(false); setSelectionNoteText(""); }}>Abbrechen</button>
-                <button type="button" className="primary" disabled={!selectionNoteText.trim()} onClick={saveSelectionNote}>Speichern</button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectionNoteOpen(false);
+                    setSelectionNoteText("");
+                    setSelectionNoteColor("yellow");
+                    setSelectionNoteColorOpen(false);
+                  }}
+                >
+                  Abbrechen
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  disabled={!selectionNoteText.trim()}
+                  onClick={saveSelectionNote}
+                >
+                  Fertig
+                </button>
               </div>
             </div>
           )}

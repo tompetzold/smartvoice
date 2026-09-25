@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
-import type { PDFDocumentProxy } from "pdfjs-dist";
+import type { PDFDocumentProxy, PDFPageProxy, RenderTask } from "pdfjs-dist";
 
 type PdfPageCanvasProps = {
   pdfDocument: PDFDocumentProxy | null;
@@ -11,7 +11,46 @@ type PdfPageCanvasProps = {
   viewerRef: RefObject<HTMLElement | null>;
 };
 
-const INTERSECTION_ROOT_MARGIN = "1400px 0px";
+const ZOOM_RENDER_DEBOUNCE_MS = 90;
+const PRIMARY_RENDER_TIMEOUT_MS = 12_000;
+const FALLBACK_RENDER_TIMEOUT_MS = 15_000;
+const MAX_CANVAS_PIXELS = 10_000_000;
+
+function getRenderPixelRatio(
+  cssWidth: number,
+  cssHeight: number,
+  preferredRatio: number,
+): number {
+  const safeWidth = Math.max(1, cssWidth);
+  const safeHeight = Math.max(1, cssHeight);
+  const safeRatio = Math.max(1, preferredRatio);
+  const requestedPixels =
+    safeWidth *
+    safeHeight *
+    safeRatio *
+    safeRatio;
+
+  if (requestedPixels <= MAX_CANVAS_PIXELS) {
+    return safeRatio;
+  }
+
+  return Math.max(
+    1,
+    Math.sqrt(MAX_CANVAS_PIXELS / (safeWidth * safeHeight)),
+  );
+}
+
+function isRenderCancellation(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : String(error);
+
+  return (
+    message.includes("Rendering cancelled") ||
+    message.includes("RenderingCancelledException")
+  );
+}
 
 function PdfPageCanvas({
   pdfDocument,
@@ -19,134 +58,90 @@ function PdfPageCanvas({
   displayScale,
   cssWidth,
   cssHeight,
-  viewerRef,
+  viewerRef: _viewerRef,
 }: PdfPageCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const wrapperRef = useRef<HTMLDivElement | null>(null);
   const renderGenerationRef = useRef(0);
 
-  const [shouldRender, setShouldRender] = useState(false);
-  const [isRendering, setIsRendering] = useState(true);
   const [isReady, setIsReady] = useState(false);
+  const [renderError, setRenderError] = useState("");
 
   useEffect(() => {
-    const wrapper = wrapperRef.current;
-
-    if (!wrapper) {
-      return;
-    }
-
-    if (typeof IntersectionObserver === "undefined") {
-      setShouldRender(true);
-      return;
-    }
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const entry = entries[0];
-
-        if (!entry) {
-          return;
-        }
-
-        setShouldRender(entry.isIntersecting);
-      },
-      {
-        root: viewerRef.current,
-        rootMargin: INTERSECTION_ROOT_MARGIN,
-        threshold: 0,
-      },
-    );
-
-    observer.observe(wrapper);
-
-    return () => {
-      observer.disconnect();
-    };
-  }, [viewerRef]);
-
-  useEffect(() => {
-    const canvasElement = canvasRef.current;
+    const visibleCanvas = canvasRef.current;
     const loadedPdfDocument = pdfDocument;
 
-    if (!canvasElement) {
+    if (!visibleCanvas) {
       return;
     }
-
-    if (!loadedPdfDocument) {
-      canvasElement.width = 1;
-      canvasElement.height = 1;
-      setIsReady(false);
-      setIsRendering(true);
-      return;
-    }
-
-    if (!shouldRender) {
-      canvasElement.width = 1;
-      canvasElement.height = 1;
-      setIsReady(false);
-      setIsRendering(true);
-      return;
-    }
-
-    const canvas: HTMLCanvasElement = canvasElement;
-    const pdf: PDFDocumentProxy = loadedPdfDocument;
 
     const generation = renderGenerationRef.current + 1;
     renderGenerationRef.current = generation;
 
     let disposed = false;
-    let renderTask: {
-      cancel: () => void;
-      promise: Promise<unknown>;
-    } | null = null;
+    let debounceTimer: number | null = null;
+    let activeRenderTask: RenderTask | null = null;
+    let activeTimeout: number | null = null;
 
-    setIsReady(false);
-    setIsRendering(true);
-
-    async function renderPage() {
-      const page = await pdf.getPage(pageNumber);
-
-      if (disposed || generation !== renderGenerationRef.current) {
-        return;
+    function clearActiveTimeout() {
+      if (activeTimeout !== null) {
+        window.clearTimeout(activeTimeout);
+        activeTimeout = null;
       }
+    }
 
+    function cancelActiveRender() {
+      clearActiveTimeout();
+
+      if (activeRenderTask) {
+        try {
+          activeRenderTask.cancel();
+        } catch {
+          // Render task may already be finished.
+        }
+        activeRenderTask = null;
+      }
+    }
+
+    if (!loadedPdfDocument) {
+      setIsReady(false);
+      setRenderError("");
+      visibleCanvas.width = 1;
+      visibleCanvas.height = 1;
+
+      return () => {
+        disposed = true;
+        renderGenerationRef.current += 1;
+      };
+    }
+
+    setRenderError("");
+
+    async function renderAttempt(
+      page: PDFPageProxy,
+      pixelRatio: number,
+      timeoutMs: number,
+    ): Promise<HTMLCanvasElement> {
       const viewport = page.getViewport({
         scale: displayScale,
       });
 
-      const devicePixelRatio = Math.max(
-        1,
-        window.devicePixelRatio || 1,
-      );
-
-      const targetCssWidth = Math.max(
-        1,
-        cssWidth,
-      );
-
-      const targetCssHeight = Math.max(
-        1,
-        cssHeight,
-      );
+      const targetCssWidth = Math.max(1, cssWidth);
+      const targetCssHeight = Math.max(1, cssHeight);
 
       const pixelWidth = Math.max(
         1,
-        Math.round(targetCssWidth * devicePixelRatio),
+        Math.round(targetCssWidth * pixelRatio),
       );
-
       const pixelHeight = Math.max(
         1,
-        Math.round(targetCssHeight * devicePixelRatio),
+        Math.round(targetCssHeight * pixelRatio),
       );
 
-      canvas.width = pixelWidth;
-      canvas.height = pixelHeight;
+      const renderCanvas = window.document.createElement("canvas");
+      renderCanvas.width = pixelWidth;
+      renderCanvas.height = pixelHeight;
 
-      canvas.style.width = `${targetCssWidth}px`;
-      canvas.style.height = `${targetCssHeight}px`;
-
-      const context = canvas.getContext("2d", {
+      const context = renderCanvas.getContext("2d", {
         alpha: false,
         willReadFrequently: false,
       });
@@ -157,48 +152,57 @@ function PdfPageCanvas({
         );
       }
 
-      context.save();
-      context.setTransform(1, 0, 0, 1, 0, 0);
       context.fillStyle = "#ffffff";
-      context.fillRect(
-        0,
-        0,
-        pixelWidth,
-        pixelHeight,
-      );
-      context.restore();
+      context.fillRect(0, 0, pixelWidth, pixelHeight);
 
-      const outputScaleX =
-        pixelWidth / viewport.width;
+      const outputScaleX = pixelWidth / viewport.width;
+      const outputScaleY = pixelHeight / viewport.height;
 
-      const outputScaleY =
-        pixelHeight / viewport.height;
+      let timedOut = false;
 
-      const transform: [
-        number,
-        number,
-        number,
-        number,
-        number,
-        number,
-      ] = [
-        outputScaleX,
-        0,
-        0,
-        outputScaleY,
-        0,
-        0,
-      ];
-
-      renderTask = page.render({
-        canvas,
+      activeRenderTask = page.render({
+        canvas: renderCanvas,
         canvasContext: context,
         viewport,
-        transform,
+        transform: [
+          outputScaleX,
+          0,
+          0,
+          outputScaleY,
+          0,
+          0,
+        ],
         background: "rgb(255,255,255)",
       });
 
-      await renderTask.promise;
+      activeTimeout = window.setTimeout(() => {
+        timedOut = true;
+
+        try {
+          activeRenderTask?.cancel();
+        } catch {
+          // Ignore an already-finished task.
+        }
+      }, timeoutMs);
+
+      try {
+        await activeRenderTask.promise;
+      } catch (error) {
+        if (timedOut) {
+          throw new Error("PDF_RENDER_TIMEOUT");
+        }
+
+        throw error;
+      } finally {
+        clearActiveTimeout();
+        activeRenderTask = null;
+      }
+
+      return renderCanvas;
+    }
+
+    async function renderPage() {
+      const page = await loadedPdfDocument.getPage(pageNumber);
 
       if (
         disposed ||
@@ -207,43 +211,138 @@ function PdfPageCanvas({
         return;
       }
 
-      setIsReady(true);
-      setIsRendering(false);
-    }
+      const preferredRatio = Math.max(
+        1,
+        window.devicePixelRatio || 1,
+      );
 
-    void renderPage().catch((error: unknown) => {
-      if (disposed) {
-        return;
+      const primaryRatio = getRenderPixelRatio(
+        cssWidth,
+        cssHeight,
+        preferredRatio,
+      );
+
+      let renderedCanvas: HTMLCanvasElement;
+
+      try {
+        renderedCanvas = await renderAttempt(
+          page,
+          primaryRatio,
+          PRIMARY_RENDER_TIMEOUT_MS,
+        );
+      } catch (error) {
+        if (
+          disposed ||
+          generation !== renderGenerationRef.current
+        ) {
+          return;
+        }
+
+        if (isRenderCancellation(error)) {
+          return;
+        }
+
+        const message =
+          error instanceof Error
+            ? error.message
+            : String(error);
+
+        if (message !== "PDF_RENDER_TIMEOUT") {
+          throw error;
+        }
+
+        cancelActiveRender();
+
+        renderedCanvas = await renderAttempt(
+          page,
+          1,
+          FALLBACK_RENDER_TIMEOUT_MS,
+        );
       }
 
-      const message =
-        error instanceof Error
-          ? error.message
-          : String(error);
-
       if (
-        message.includes("Rendering cancelled") ||
-        message.includes("RenderingCancelledException")
+        disposed ||
+        generation !== renderGenerationRef.current
       ) {
         return;
       }
 
-      setIsReady(false);
-      setIsRendering(false);
+      const currentCanvas = canvasRef.current;
 
-      console.error(
-        `PDF-Seite ${pageNumber} konnte nicht gerendert werden:`,
-        error,
+      if (!currentCanvas) {
+        return;
+      }
+
+      currentCanvas.width = renderedCanvas.width;
+      currentCanvas.height = renderedCanvas.height;
+      currentCanvas.style.width = `${Math.max(1, cssWidth)}px`;
+      currentCanvas.style.height = `${Math.max(1, cssHeight)}px`;
+
+      const visibleContext = currentCanvas.getContext("2d", {
+        alpha: false,
+        willReadFrequently: false,
+      });
+
+      if (!visibleContext) {
+        throw new Error(
+          `Canvas-Kontext für PDF-Seite ${pageNumber} konnte nicht erstellt werden.`,
+        );
+      }
+
+      visibleContext.setTransform(1, 0, 0, 1, 0, 0);
+      visibleContext.fillStyle = "#ffffff";
+      visibleContext.fillRect(
+        0,
+        0,
+        currentCanvas.width,
+        currentCanvas.height,
       );
-    });
+      visibleContext.drawImage(renderedCanvas, 0, 0);
+
+      setRenderError("");
+      setIsReady(true);
+    }
+
+    debounceTimer = window.setTimeout(() => {
+      void renderPage().catch((error: unknown) => {
+        if (
+          disposed ||
+          generation !== renderGenerationRef.current
+        ) {
+          return;
+        }
+
+        if (isRenderCancellation(error)) {
+          return;
+        }
+
+        const message =
+          error instanceof Error
+            ? error.message
+            : String(error);
+
+        setRenderError(
+          message === "PDF_RENDER_TIMEOUT"
+            ? "Seite konnte nicht rechtzeitig gerendert werden."
+            : "Seite konnte nicht gerendert werden.",
+        );
+
+        console.error(
+          `PDF-Seite ${pageNumber} konnte nicht gerendert werden:`,
+          error,
+        );
+      });
+    }, ZOOM_RENDER_DEBOUNCE_MS);
 
     return () => {
       disposed = true;
       renderGenerationRef.current += 1;
 
-      if (renderTask) {
-        renderTask.cancel();
+      if (debounceTimer !== null) {
+        window.clearTimeout(debounceTimer);
       }
+
+      cancelActiveRender();
     };
   }, [
     pdfDocument,
@@ -251,15 +350,13 @@ function PdfPageCanvas({
     displayScale,
     cssWidth,
     cssHeight,
-    shouldRender,
   ]);
 
-  const showSkeleton = !isReady || isRendering;
+  const showSkeleton = !isReady && !renderError;
 
   return (
     <div
       className={`pdf-canvas-wrapper ${showSkeleton ? "loading" : "ready"}`}
-      ref={wrapperRef}
       style={{
         width: `${cssWidth}px`,
         height: `${cssHeight}px`,
@@ -301,8 +398,18 @@ function PdfPageCanvas({
         </div>
       )}
 
+      {renderError && !isReady && (
+        <div className="page-skeleton" role="status">
+          <div className="page-skeleton-group">
+            <div className="page-skeleton-row medium" />
+            <div className="page-skeleton-row wide" />
+            <div className="page-skeleton-row short" />
+          </div>
+        </div>
+      )}
+
       <canvas
-        className={`pdf-page-canvas ${showSkeleton ? "hidden" : "ready"}`}
+        className={`pdf-page-canvas ${isReady ? "ready" : "hidden"}`}
         ref={canvasRef}
         aria-label={`PDF-Seite ${pageNumber}`}
         style={{
