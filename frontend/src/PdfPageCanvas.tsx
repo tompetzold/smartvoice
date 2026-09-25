@@ -9,12 +9,161 @@ type PdfPageCanvasProps = {
   cssWidth: number;
   cssHeight: number;
   viewerRef: RefObject<HTMLElement | null>;
+  renderPriority: 0 | 1;
 };
 
 const ZOOM_RENDER_DEBOUNCE_MS = 90;
 const PRIMARY_RENDER_TIMEOUT_MS = 12_000;
 const FALLBACK_RENDER_TIMEOUT_MS = 15_000;
 const MAX_CANVAS_PIXELS = 10_000_000;
+const MAX_CONCURRENT_PDF_RENDERS = 2;
+
+type QueuedPdfRender = {
+  id: number;
+  priority: number;
+  sequence: number;
+  started: boolean;
+  cancelled: boolean;
+  settled: boolean;
+  run: () => Promise<void>;
+  resolve: () => void;
+  reject: (error: unknown) => void;
+};
+
+type ScheduledPdfRender = {
+  promise: Promise<void>;
+  cancel: () => void;
+  updatePriority: (priority: number) => void;
+};
+
+let activePdfRenderCount = 0;
+let nextPdfRenderId = 1;
+let nextPdfRenderSequence = 1;
+const queuedPdfRenders: QueuedPdfRender[] = [];
+
+function removeQueuedPdfRender(entry: QueuedPdfRender) {
+  const index = queuedPdfRenders.indexOf(entry);
+
+  if (index >= 0) {
+    queuedPdfRenders.splice(index, 1);
+  }
+}
+
+function settleCancelledPdfRender(entry: QueuedPdfRender) {
+  if (entry.settled) {
+    return;
+  }
+
+  entry.settled = true;
+  entry.resolve();
+}
+
+function pumpPdfRenderQueue() {
+  queuedPdfRenders.sort((left, right) => {
+    if (left.priority !== right.priority) {
+      return left.priority - right.priority;
+    }
+
+    return left.sequence - right.sequence;
+  });
+
+  while (
+    activePdfRenderCount < MAX_CONCURRENT_PDF_RENDERS &&
+    queuedPdfRenders.length > 0
+  ) {
+    const entry = queuedPdfRenders.shift();
+
+    if (!entry) {
+      return;
+    }
+
+    if (entry.cancelled) {
+      settleCancelledPdfRender(entry);
+      continue;
+    }
+
+    entry.started = true;
+    activePdfRenderCount += 1;
+
+    void entry
+      .run()
+      .then(() => {
+        if (!entry.settled) {
+          entry.settled = true;
+          entry.resolve();
+        }
+      })
+      .catch((error: unknown) => {
+        if (!entry.settled) {
+          entry.settled = true;
+          entry.reject(error);
+        }
+      })
+      .finally(() => {
+        activePdfRenderCount = Math.max(
+          0,
+          activePdfRenderCount - 1,
+        );
+        pumpPdfRenderQueue();
+      });
+  }
+}
+
+function schedulePdfRender(
+  priority: number,
+  run: () => Promise<void>,
+): ScheduledPdfRender {
+  let entry!: QueuedPdfRender;
+
+  const promise = new Promise<void>((resolve, reject) => {
+    entry = {
+      id: nextPdfRenderId,
+      priority,
+      sequence: nextPdfRenderSequence,
+      started: false,
+      cancelled: false,
+      settled: false,
+      run,
+      resolve,
+      reject,
+    };
+
+    nextPdfRenderId += 1;
+    nextPdfRenderSequence += 1;
+
+    queuedPdfRenders.push(entry);
+    pumpPdfRenderQueue();
+  });
+
+  return {
+    promise,
+    cancel: () => {
+      if (entry.cancelled || entry.settled) {
+        return;
+      }
+
+      entry.cancelled = true;
+
+      if (!entry.started) {
+        removeQueuedPdfRender(entry);
+        settleCancelledPdfRender(entry);
+      }
+    },
+    updatePriority: (nextPriority: number) => {
+      if (
+        entry.started ||
+        entry.cancelled ||
+        entry.settled ||
+        entry.priority === nextPriority
+      ) {
+        return;
+      }
+
+      entry.priority = nextPriority;
+      pumpPdfRenderQueue();
+    },
+  };
+}
 
 function getRenderPixelRatio(
   cssWidth: number,
@@ -59,12 +208,18 @@ function PdfPageCanvas({
   cssWidth,
   cssHeight,
   viewerRef: _viewerRef,
+  renderPriority,
 }: PdfPageCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const renderGenerationRef = useRef(0);
+  const scheduledRenderRef = useRef<ScheduledPdfRender | null>(null);
 
   const [isReady, setIsReady] = useState(false);
   const [renderError, setRenderError] = useState("");
+
+  useEffect(() => {
+    scheduledRenderRef.current?.updatePriority(renderPriority);
+  }, [renderPriority]);
 
   useEffect(() => {
     const visibleCanvas = canvasRef.current;
@@ -96,8 +251,9 @@ function PdfPageCanvas({
         try {
           activeRenderTask.cancel();
         } catch {
-          // Render task may already be finished.
+          // The render task may already be complete.
         }
+
         activeRenderTask = null;
       }
     }
@@ -181,7 +337,7 @@ function PdfPageCanvas({
         try {
           activeRenderTask?.cancel();
         } catch {
-          // Ignore an already-finished task.
+          // Ignore an already completed task.
         }
       }, timeoutMs);
 
@@ -304,34 +460,56 @@ function PdfPageCanvas({
     }
 
     debounceTimer = window.setTimeout(() => {
-      void renderPage().catch((error: unknown) => {
-        if (
-          disposed ||
-          generation !== renderGenerationRef.current
-        ) {
-          return;
-        }
+      const scheduledRender = schedulePdfRender(
+        renderPriority,
+        async () => {
+          if (
+            disposed ||
+            generation !== renderGenerationRef.current
+          ) {
+            return;
+          }
 
-        if (isRenderCancellation(error)) {
-          return;
-        }
+          await renderPage();
+        },
+      );
 
-        const message =
-          error instanceof Error
-            ? error.message
-            : String(error);
+      scheduledRenderRef.current = scheduledRender;
 
-        setRenderError(
-          message === "PDF_RENDER_TIMEOUT"
-            ? "Seite konnte nicht rechtzeitig gerendert werden."
-            : "Seite konnte nicht gerendert werden.",
-        );
+      void scheduledRender.promise
+        .catch((error: unknown) => {
+          if (
+            disposed ||
+            generation !== renderGenerationRef.current
+          ) {
+            return;
+          }
 
-        console.error(
-          `PDF-Seite ${pageNumber} konnte nicht gerendert werden:`,
-          error,
-        );
-      });
+          if (isRenderCancellation(error)) {
+            return;
+          }
+
+          const message =
+            error instanceof Error
+              ? error.message
+              : String(error);
+
+          setRenderError(
+            message === "PDF_RENDER_TIMEOUT"
+              ? "Seite konnte nicht rechtzeitig gerendert werden."
+              : "Seite konnte nicht gerendert werden.",
+          );
+
+          console.error(
+            `PDF-Seite ${pageNumber} konnte nicht gerendert werden:`,
+            error,
+          );
+        })
+        .finally(() => {
+          if (scheduledRenderRef.current === scheduledRender) {
+            scheduledRenderRef.current = null;
+          }
+        });
     }, ZOOM_RENDER_DEBOUNCE_MS);
 
     return () => {
@@ -342,6 +520,8 @@ function PdfPageCanvas({
         window.clearTimeout(debounceTimer);
       }
 
+      scheduledRenderRef.current?.cancel();
+      scheduledRenderRef.current = null;
       cancelActiveRender();
     };
   }, [

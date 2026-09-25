@@ -615,6 +615,7 @@ function App() {
   const [currentChunkLocalSeconds, setCurrentChunkLocalSeconds] = useState(0);
   const [activeWordTiming, setActiveWordTiming] = useState<WordTiming | null>(null);
   const [viewportPageNumber, setViewportPageNumber] = useState(1);
+  const [visiblePageNumbers, setVisiblePageNumbers] = useState<number[]>([1]);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playerVisible, setPlayerVisible] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
@@ -708,6 +709,7 @@ function App() {
   const activeWordIdRef = useRef("");
   const lastPlaybackUiUpdateAtRef = useRef(0);
   const viewportPageNumberRef = useRef(1);
+  const pageVisibilityRef = useRef<Record<number, boolean>>({});
   const readerMenuRef = useRef<HTMLElement | null>(null);
   const documentItemRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const documentListRef = useRef<HTMLDivElement | null>(null);
@@ -729,6 +731,49 @@ function App() {
 
   const pages = documentData?.pages ?? [];
   const chunks = documentData?.chunks ?? [];
+
+  const pdfRenderPlan = useMemo(() => {
+    const plan = new Map<number, 0 | 1>();
+    const pageCount = pages.length;
+
+    if (pageCount === 0) {
+      return plan;
+    }
+
+    const normalizedVisiblePages = visiblePageNumbers
+      .filter((pageNumber) => pageNumber >= 1 && pageNumber <= pageCount)
+      .sort((left, right) => left - right);
+
+    const effectiveVisiblePages =
+      normalizedVisiblePages.length > 0
+        ? normalizedVisiblePages
+        : [
+            Math.max(
+              1,
+              Math.min(pageCount, viewportPageNumber),
+            ),
+          ];
+
+    for (const pageNumber of effectiveVisiblePages) {
+      plan.set(pageNumber, 0);
+    }
+
+    for (const pageNumber of effectiveVisiblePages) {
+      const previousPage = pageNumber - 1;
+      const nextPage = pageNumber + 1;
+
+      if (previousPage >= 1 && !plan.has(previousPage)) {
+        plan.set(previousPage, 1);
+      }
+
+      if (nextPage <= pageCount && !plan.has(nextPage)) {
+        plan.set(nextPage, 1);
+      }
+    }
+
+    return plan;
+  }, [pages.length, visiblePageNumbers, viewportPageNumber]);
+
   const activeChunk = chunks[activeChunkIndex] ?? null;
   const hasVoice = voices.length > 0 && selectedVoiceId.length > 0;
   const activeChunkAudio =
@@ -903,11 +948,25 @@ function App() {
 
   useEffect(() => {
     documentDataRef.current = documentData;
+    pageVisibilityRef.current = {};
+
     if (documentData) {
       const persisted = readStoredReaderState(documentData.documentId);
-      const pageNumber = Math.max(1, Math.min(documentData.pages.length || 1, persisted?.pageNumber ?? 1));
+      const pageNumber = Math.max(
+        1,
+        Math.min(
+          documentData.pages.length || 1,
+          persisted?.pageNumber ?? 1,
+        ),
+      );
+
       viewportPageNumberRef.current = pageNumber;
       setViewportPageNumber(pageNumber);
+      setVisiblePageNumbers([pageNumber]);
+    } else {
+      viewportPageNumberRef.current = 1;
+      setViewportPageNumber(1);
+      setVisiblePageNumbers([1]);
     }
   }, [documentData]);
 
@@ -917,52 +976,118 @@ function App() {
     }
 
     const viewer = viewerRef.current;
-    if (!viewer || pages.length === 0 || typeof IntersectionObserver === "undefined") {
+
+    if (
+      !viewer ||
+      pages.length === 0 ||
+      typeof IntersectionObserver === "undefined"
+    ) {
       return;
     }
 
+    pageVisibilityRef.current = {};
+
+    const updateVisiblePages = () => {
+      const nextVisiblePages = Object.entries(pageVisibilityRef.current)
+        .filter(([, isVisible]) => isVisible)
+        .map(([pageNumber]) => Number(pageNumber))
+        .filter(Number.isFinite)
+        .sort((left, right) => left - right);
+
+      setVisiblePageNumbers((current) => {
+        if (
+          current.length === nextVisiblePages.length &&
+          current.every(
+            (pageNumber, index) =>
+              pageNumber === nextVisiblePages[index],
+          )
+        ) {
+          return current;
+        }
+
+        return nextVisiblePages;
+      });
+
+      if (nextVisiblePages.length === 0) {
+        return;
+      }
+
+      const viewerRect = viewer.getBoundingClientRect();
+      let bestPageNumber = nextVisiblePages[0];
+      let bestOverlap = -1;
+
+      for (const pageNumber of nextVisiblePages) {
+        const pageElement = pageRefs.current[pageNumber];
+
+        if (!pageElement) {
+          continue;
+        }
+
+        const pageRect = pageElement.getBoundingClientRect();
+        const overlap = Math.max(
+          0,
+          Math.min(pageRect.bottom, viewerRect.bottom) -
+            Math.max(pageRect.top, viewerRect.top),
+        );
+
+        if (overlap > bestOverlap) {
+          bestOverlap = overlap;
+          bestPageNumber = pageNumber;
+        }
+      }
+
+      if (bestPageNumber !== viewportPageNumberRef.current) {
+        viewportPageNumberRef.current = bestPageNumber;
+        setViewportPageNumber(bestPageNumber);
+      }
+    };
+
     const observer = new IntersectionObserver(
       (entries) => {
-        const visibleEntries = entries.filter((entry) => entry.isIntersecting);
-        if (visibleEntries.length === 0) {
-          return;
-        }
+        for (const entry of entries) {
+          const pageNumber = Number(
+            (entry.target as HTMLElement).dataset.pageNumber,
+          );
 
-        const rootTop = visibleEntries[0].rootBounds?.top ?? viewer.getBoundingClientRect().top;
-        let bestEntry = visibleEntries[0];
-        let bestDistance = Math.abs(bestEntry.boundingClientRect.top - rootTop);
-
-        for (const entry of visibleEntries.slice(1)) {
-          const distance = Math.abs(entry.boundingClientRect.top - rootTop);
-          if (distance < bestDistance) {
-            bestEntry = entry;
-            bestDistance = distance;
+          if (!Number.isFinite(pageNumber)) {
+            continue;
           }
+
+          pageVisibilityRef.current[pageNumber] =
+            entry.isIntersecting &&
+            entry.intersectionRect.height > 0 &&
+            entry.intersectionRect.width > 0;
         }
 
-        const pageNumber = Number((bestEntry.target as HTMLElement).dataset.pageNumber);
-        if (!Number.isFinite(pageNumber) || pageNumber === viewportPageNumberRef.current) {
-          return;
-        }
-
-        viewportPageNumberRef.current = pageNumber;
-        setViewportPageNumber(pageNumber);
+        updateVisiblePages();
       },
       {
         root: viewer,
-        rootMargin: "120% 0px 120% 0px",
-        threshold: [0, 0.01, 0.25, 0.5, 0.75, 1],
+        rootMargin: "0px",
+        threshold: [0, 0.001, 0.05, 0.25, 0.5, 0.75, 1],
       },
     );
 
-    for (const element of Object.values(pageRefs.current) as Array<HTMLElement | null>) {
+    for (
+      const element of Object.values(pageRefs.current) as Array<
+        HTMLElement | null
+      >
+    ) {
       if (element) {
         observer.observe(element);
       }
     }
 
-    return () => observer.disconnect();
-  }, [pages.length, zoom, documentData?.documentId, openingDocumentId]);
+    return () => {
+      observer.disconnect();
+      pageVisibilityRef.current = {};
+    };
+  }, [
+    pages.length,
+    zoom,
+    documentData?.documentId,
+    openingDocumentId,
+  ]);
 
   useEffect(() => {
     selectedVoiceIdRef.current = selectedVoiceId;
@@ -2899,6 +3024,8 @@ function App() {
     setCurrentChunkLocalSeconds(0);
     viewportPageNumberRef.current = 1;
     setViewportPageNumber(1);
+    pageVisibilityRef.current = {};
+    setVisiblePageNumbers([1]);
     pendingScrollRestoreRef.current = null;
     pageRefs.current = {};
 
@@ -4213,15 +4340,9 @@ function App() {
             )}
   
             {pages.map((page) => {
-              const renderRadius =
-                zoom >= 1.5
-                  ? 1
-                  : zoom >= 1
-                    ? 2
-                    : 3;
-              const inRenderWindow =
-                Math.abs(page.pageNumber - viewportPageNumber) <= renderRadius;
-  
+              const renderPriority = pdfRenderPlan.get(page.pageNumber);
+              const shouldRenderPage = renderPriority !== undefined;
+
               return (
                 <article
                   className="page-card"
@@ -4238,7 +4359,7 @@ function App() {
                       height: `${page.height * zoom}px`,
                     }}
                   >
-                    {inRenderWindow ? (
+                    {shouldRenderPage ? (
                       <>
                         <PdfPageCanvas
                           pdfDocument={pdfDocument}
@@ -4247,6 +4368,7 @@ function App() {
                           cssWidth={page.width * zoom}
                           cssHeight={page.height * zoom}
                           viewerRef={viewerRef}
+                          renderPriority={renderPriority}
                         />
                         {renderUnitHighlights(page)}
                       </>
