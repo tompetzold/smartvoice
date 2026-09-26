@@ -270,6 +270,8 @@ function PdfPageCanvas({
       };
     }
 
+    const activePdfDocument = loadedPdfDocument;
+
     setRenderError("");
 
     async function renderAttempt(
@@ -358,7 +360,7 @@ function PdfPageCanvas({
     }
 
     async function renderPage() {
-      const page = await loadedPdfDocument.getPage(pageNumber);
+      const page = await activePdfDocument.getPage(pageNumber);
 
       if (
         disposed ||

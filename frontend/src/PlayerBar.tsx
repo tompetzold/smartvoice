@@ -44,6 +44,7 @@ type PlayerBarProps = {
   voices: VoiceOption[];
   voiceVariants: VoiceVariant[];
   selectedVoiceId: string;
+  openVoicePickerOnMount?: boolean;
   autoScrollEnabled: boolean;
   onPlayPause: () => void;
   onSeekGlobalTime: (seconds: number) => void;
@@ -238,6 +239,7 @@ export default function PlayerBar({
   voices,
   voiceVariants,
   selectedVoiceId,
+  openVoicePickerOnMount = false,
   autoScrollEnabled,
   onPlayPause,
   onSeekGlobalTime,
@@ -253,7 +255,7 @@ export default function PlayerBar({
   onDismissPlaybackError,
   onClose,
 }: PlayerBarProps) {
-  const [voiceOpen, setVoiceOpen] = useState(false);
+  const [voiceOpen, setVoiceOpen] = useState(openVoicePickerOnMount);
   const [voiceVariantOpen, setVoiceVariantOpen] = useState(false);
   const [selectedProvider, setSelectedProvider] = useState<VoiceProvider>("piper");
   const [speedOpen, setSpeedOpen] = useState(false);
@@ -613,7 +615,7 @@ export default function PlayerBar({
             <div className="speed-vertical-control">
               <div className="speed-vertical-rail">
                 <div className="speed-vertical-ticks">
-                  {speedTickRates.map((rate, index) => {
+                  {speedTickRates.map((rate) => {
                     const tickPercent = ((rate - 0.5) / 2) * 100;
                     const isActive = Math.abs(playbackRate - rate) < 0.001;
                     const isHovered = hoveredSpeedTick === rate;

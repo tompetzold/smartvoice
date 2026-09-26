@@ -1,0 +1,11 @@
+-r requirements.txt
+
+# Kokoro runtime is installed into the image once instead of installing
+# packages while SmartVoice is already running.
+huggingface-hub>=0.30
+soundfile>=0.13
+numpy
+torch
+
+git+https://github.com/semidark/misaki.git@6d252a2e02f3b030f22f56686f1a73786c16ffc8
+git+https://github.com/semidark/kokoro.git

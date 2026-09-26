@@ -187,7 +187,7 @@ type DocumentData = {
 type PiperVoice = {
   id: string;
   name: string;
-  provider: "piper" | "kokoro" | "cosyvoice";
+  provider: "piper" | "kokoro";
   variantLabel: string;
   language: string;
   quality: string;
@@ -208,7 +208,7 @@ type PiperVoice = {
 };
 
 type VoiceVariant = {
-  id: "piper" | "kokoro" | "cosyvoice";
+  id: "piper" | "kokoro";
   label: string;
 };
 
@@ -275,6 +275,8 @@ type PersistedReaderState = {
 };
 
 const API_BASE_URL = "http://127.0.0.1:8001";
+const AUDIO_CHUNK_FADE_IN_MS = 16;
+const AUDIO_CHUNK_FADE_OUT_MS = 24;
 
 function toApiAssetUrl(relativeUrl?: string): string {
   if (!relativeUrl) {
@@ -609,7 +611,7 @@ function App() {
   const [status, setStatus] = useState("Keine PDF geladen.");
   const [zoom, setZoom] = useState(0.65);
   const [activeChunkIndex, setActiveChunkIndex] = useState(0);
-  const [activeUnitId, setActiveUnitId] = useState("");
+  const [, setActiveUnitId] = useState("");
   const [selectedUnitId, setSelectedUnitId] = useState("");
   const [hoveredUnitId, setHoveredUnitId] = useState("");
   const [currentChunkLocalSeconds, setCurrentChunkLocalSeconds] = useState(0);
@@ -654,10 +656,6 @@ function App() {
   });
   const [addDocumentDialogOpen, setAddDocumentDialogOpen] = useState(false);
   const [draggedDocumentId, setDraggedDocumentId] = useState("");
-  const [documentDropTarget, setDocumentDropTarget] = useState<{
-    documentId: string;
-    position: "before" | "after";
-  } | null>(null);
   const [documentDragPreviewPosition, setDocumentDragPreviewPosition] = useState<{
     x: number;
     y: number;
@@ -677,6 +675,10 @@ function App() {
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const playbackRateRef = useRef(1.0);
+  const volumeRef = useRef(1.0);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioSourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const audioGainNodeRef = useRef<GainNode | null>(null);
   const viewerRef = useRef<HTMLElement | null>(null);
   const zoomRef = useRef(zoom);
   const pinchAccumulatorRef = useRef(0);
@@ -1305,7 +1307,6 @@ function App() {
     void loadingTask.promise
       .then((pdf) => {
         if (disposed) {
-          void pdf.destroy();
           return;
         }
 
@@ -1465,6 +1466,17 @@ function App() {
         readerPersistTimerRef.current = null;
       }
 
+      clearAudioFadeSchedule();
+
+      const audioContext = audioContextRef.current;
+      audioContextRef.current = null;
+      audioSourceNodeRef.current = null;
+      audioGainNodeRef.current = null;
+
+      if (audioContext && audioContext.state !== "closed") {
+        void audioContext.close().catch(() => undefined);
+      }
+
       for (const controller of requestControllersRef.current) {
         controller.abort();
       }
@@ -1483,14 +1495,36 @@ function App() {
 
     audio.defaultPlaybackRate = playbackRate;
     audio.playbackRate = playbackRate;
+
+    if (!audio.paused && !audio.ended) {
+      scheduleAudioChunkFadeOut(audio);
+    }
   }, [playbackRate]);
 
   useEffect(() => {
-    if (!audioRef.current) {
+    volumeRef.current = volume;
+
+    const audio = audioRef.current;
+    if (!audio) {
       return;
     }
 
-    audioRef.current.volume = volume;
+    const context = audioContextRef.current;
+    const gainNode = audioGainNodeRef.current;
+
+    if (context && gainNode) {
+      const now = context.currentTime;
+      gainNode.gain.cancelScheduledValues(now);
+      gainNode.gain.setValueAtTime(clampAudioVolume(volume), now);
+
+      if (!audio.paused && !audio.ended) {
+        scheduleAudioChunkFadeOut(audio);
+      }
+
+      return;
+    }
+
+    audio.volume = clampAudioVolume(volume);
   }, [volume]);
 
   useEffect(() => {
@@ -1612,6 +1646,8 @@ function App() {
       return;
     }
 
+    const activeAudio = audio;
+
     function syncPlaybackPosition() {
       const currentAudio = audioRef.current;
 
@@ -1679,6 +1715,8 @@ function App() {
     }
 
     function handleEnded() {
+      clearAudioFadeSchedule();
+      setAudioGainImmediately(0);
       stopAnimationLoop();
       syncPlaybackPosition();
 
@@ -1701,18 +1739,20 @@ function App() {
     function handlePlay() {
       setIsPlaying(true);
       startAnimationLoop();
+      applyAudioChunkFadeIn(activeAudio);
     }
 
     function handlePause() {
+      clearAudioFadeSchedule();
       syncPlaybackPosition();
       stopAnimationLoop();
       setIsPlaying(false);
     }
 
-    audio.addEventListener("timeupdate", handleTimeUpdate);
-    audio.addEventListener("ended", handleEnded);
-    audio.addEventListener("play", handlePlay);
-    audio.addEventListener("pause", handlePause);
+    activeAudio.addEventListener("timeupdate", handleTimeUpdate);
+    activeAudio.addEventListener("ended", handleEnded);
+    activeAudio.addEventListener("play", handlePlay);
+    activeAudio.addEventListener("pause", handlePause);
 
     if (!audio.paused && !audio.ended) {
       startAnimationLoop();
@@ -1720,10 +1760,10 @@ function App() {
 
     return () => {
       stopAnimationLoop();
-      audio.removeEventListener("timeupdate", handleTimeUpdate);
-      audio.removeEventListener("ended", handleEnded);
-      audio.removeEventListener("play", handlePlay);
-      audio.removeEventListener("pause", handlePause);
+      activeAudio.removeEventListener("timeupdate", handleTimeUpdate);
+      activeAudio.removeEventListener("ended", handleEnded);
+      activeAudio.removeEventListener("play", handlePlay);
+      activeAudio.removeEventListener("pause", handlePause);
     };
   }, [activeChunkIndex, chunks.length, activeChunkAudio]);
 
@@ -2100,7 +2140,6 @@ function App() {
     documentPointerDragRef.current = null;
     documentDropTargetRef.current = null;
     setDraggedDocumentId("");
-    setDocumentDropTarget(null);
     setDocumentDragPreviewPosition(null);
   }
 
@@ -2142,7 +2181,6 @@ function App() {
       } as const;
 
       documentDropTargetRef.current = nextTarget;
-      setDocumentDropTarget(nextTarget);
       reorderSidebarDocument(draggedId, targetId, position);
       return;
     }
@@ -2192,8 +2230,7 @@ function App() {
         currentTarget.position !== nextTarget.position
       ) {
         documentDropTargetRef.current = nextTarget;
-        setDocumentDropTarget(nextTarget);
-        reorderSidebarDocument(
+          reorderSidebarDocument(
           draggedId,
           nextTarget.documentId,
           nextTarget.position,
@@ -2221,8 +2258,7 @@ function App() {
         currentTarget.position !== nextTarget.position
       ) {
         documentDropTargetRef.current = nextTarget;
-        setDocumentDropTarget(nextTarget);
-        reorderSidebarDocument(
+          reorderSidebarDocument(
           draggedId,
           nextTarget.documentId,
           nextTarget.position,
@@ -2692,6 +2728,141 @@ function App() {
     });
   }
 
+  function ensureAudioGraph(audio: HTMLAudioElement): AudioContext | null {
+    try {
+      let context = audioContextRef.current;
+      let gainNode = audioGainNodeRef.current;
+
+      if (!context) {
+        context = new AudioContext({ latencyHint: "interactive" });
+
+        const sourceNode = context.createMediaElementSource(audio);
+        gainNode = context.createGain();
+
+        sourceNode.connect(gainNode);
+        gainNode.connect(context.destination);
+
+        audioContextRef.current = context;
+        audioSourceNodeRef.current = sourceNode;
+        audioGainNodeRef.current = gainNode;
+
+        // Volume is controlled exclusively by the GainNode once the media
+        // element is attached to Web Audio.
+        audio.volume = 1;
+        gainNode.gain.value = clampAudioVolume(volumeRef.current);
+      }
+
+      if (context.state === "suspended") {
+        void context.resume().catch(() => undefined);
+      }
+
+      return context;
+    } catch (error) {
+      console.warn("Web-Audio-Ausgabe konnte nicht initialisiert werden:", error);
+      return null;
+    }
+  }
+
+  function clampAudioVolume(value: number) {
+    return Math.max(0, Math.min(1, value));
+  }
+
+  function cancelScheduledAudioGain() {
+    const context = audioContextRef.current;
+    const gainNode = audioGainNodeRef.current;
+
+    if (!context || !gainNode) {
+      return;
+    }
+
+    const now = context.currentTime;
+
+    try {
+      gainNode.gain.cancelAndHoldAtTime(now);
+    } catch {
+      const currentValue = gainNode.gain.value;
+      gainNode.gain.cancelScheduledValues(now);
+      gainNode.gain.setValueAtTime(currentValue, now);
+    }
+  }
+
+  function setAudioGainImmediately(value: number) {
+    const context = audioContextRef.current;
+    const gainNode = audioGainNodeRef.current;
+
+    if (!context || !gainNode) {
+      const audio = audioRef.current;
+      if (audio) {
+        audio.volume = clampAudioVolume(value);
+      }
+      return;
+    }
+
+    const now = context.currentTime;
+    const nextValue = clampAudioVolume(value);
+
+    gainNode.gain.cancelScheduledValues(now);
+    gainNode.gain.setValueAtTime(nextValue, now);
+  }
+
+  function clearAudioFadeSchedule() {
+    cancelScheduledAudioGain();
+  }
+
+  function scheduleAudioChunkFadeOut(audio: HTMLAudioElement) {
+    const context = ensureAudioGraph(audio);
+    const gainNode = audioGainNodeRef.current;
+
+    if (
+      !context ||
+      !gainNode ||
+      audio.paused ||
+      audio.ended ||
+      !Number.isFinite(audio.duration) ||
+      audio.duration <= 0
+    ) {
+      return;
+    }
+
+    const rate = Math.max(0.05, audio.playbackRate || playbackRateRef.current || 1);
+    const remainingMediaSeconds = Math.max(0, audio.duration - audio.currentTime);
+    const remainingWallSeconds = remainingMediaSeconds / rate;
+    const fadeSeconds = Math.min(
+      AUDIO_CHUNK_FADE_OUT_MS / 1000,
+      Math.max(0.004, remainingWallSeconds),
+    );
+    const now = context.currentTime;
+    const fadeStart = now + Math.max(0, remainingWallSeconds - fadeSeconds);
+    const fadeEnd = now + remainingWallSeconds;
+    const targetVolume = clampAudioVolume(volumeRef.current);
+
+    // Do not disturb an already scheduled fade-in at the current time.
+    gainNode.gain.cancelScheduledValues(fadeStart);
+    gainNode.gain.setValueAtTime(targetVolume, fadeStart);
+    gainNode.gain.linearRampToValueAtTime(0, fadeEnd);
+  }
+
+  function applyAudioChunkFadeIn(audio: HTMLAudioElement) {
+    const context = ensureAudioGraph(audio);
+    const gainNode = audioGainNodeRef.current;
+    const targetVolume = clampAudioVolume(volumeRef.current);
+
+    if (!context || !gainNode) {
+      audio.volume = targetVolume;
+      return;
+    }
+
+    const now = context.currentTime;
+    const fadeEnd = now + AUDIO_CHUNK_FADE_IN_MS / 1000;
+
+    audio.volume = 1;
+    gainNode.gain.cancelScheduledValues(now);
+    gainNode.gain.setValueAtTime(0, now);
+    gainNode.gain.linearRampToValueAtTime(targetVolume, fadeEnd);
+
+    scheduleAudioChunkFadeOut(audio);
+  }
+
   async function playChunk(
     index: number,
     startLocalSeconds: number,
@@ -2732,8 +2903,16 @@ function App() {
     const firstUnit = chunk.units[0] ?? null;
     const cacheKey = buildAudioCacheKey(voiceId, chunk.id, skipContentSettingsRef.current);
 
-    if (audioRef.current && !audioRef.current.paused) {
-      audioRef.current.pause();
+    const currentAudio = audioRef.current;
+    if (currentAudio) {
+      ensureAudioGraph(currentAudio);
+    }
+
+    clearAudioFadeSchedule();
+    setAudioGainImmediately(0);
+
+    if (currentAudio && !currentAudio.paused) {
+      currentAudio.pause();
     }
 
     setIsPlaying(false);
@@ -2798,7 +2977,7 @@ function App() {
       audio.currentTime = safeStart;
       audio.defaultPlaybackRate = currentPlaybackRate;
       audio.playbackRate = currentPlaybackRate;
-      audio.volume = volume;
+      audio.volume = audioContextRef.current ? 1 : 0;
       currentChunkLocalSecondsRef.current = safeStart;
       setCurrentChunkLocalSeconds(safeStart);
 
@@ -2809,6 +2988,7 @@ function App() {
         sessionId !== generationSessionRef.current ||
         voiceId !== selectedVoiceIdRef.current
       ) {
+        clearAudioFadeSchedule();
         audio.pause();
         return;
       }
@@ -2863,6 +3043,7 @@ function App() {
 
     if (audioRef.current?.src && audioRef.current.currentTime > 0 && !audioRef.current.ended) {
       const currentPlaybackRate = playbackRateRef.current;
+      ensureAudioGraph(audioRef.current);
       audioRef.current.defaultPlaybackRate = currentPlaybackRate;
       audioRef.current.playbackRate = currentPlaybackRate;
       await audioRef.current.play();
@@ -2943,6 +3124,8 @@ function App() {
 
   function stopPlayback() {
     playbackAttemptRef.current += 1;
+    clearAudioFadeSchedule();
+    setAudioGainImmediately(0);
 
     if (audioRef.current) {
       audioRef.current.pause();
@@ -2981,6 +3164,12 @@ function App() {
 
     setPlaybackError(null);
     setPlayerVisible(true);
+
+    if (!hasVoice) {
+      setStatus("Stimme herunterladen oder auswählen");
+      return;
+    }
+
     void handlePlayPause();
   }
 
@@ -3882,7 +4071,7 @@ function App() {
 
   return (
     <main className={`app-shell theme-${appliedTheme} cursor-color-${cursorColor} ${sidebarCollapsed ? "sidebar-collapsed" : "sidebar-expanded"}`}>
-      <audio ref={audioRef} />
+      <audio ref={audioRef} crossOrigin="anonymous" />
 
       <aside className="library-sidebar">
         <div className="brand-row">
@@ -3957,8 +4146,7 @@ function App() {
                     };
 
                     documentDropTargetRef.current = null;
-                    setDocumentDropTarget(null);
-                    setDocumentDragPreviewMetrics({
+                                    setDocumentDragPreviewMetrics({
                       offsetX: event.clientX - sourceRect.left,
                       offsetY: event.clientY - sourceRect.top,
                       width: sourceRect.width,
@@ -4851,6 +5039,7 @@ function App() {
             voices={voices}
             voiceVariants={voiceVariants}
             selectedVoiceId={selectedVoiceId}
+            openVoicePickerOnMount={!hasVoice}
             autoScrollEnabled={autoScrollEnabled}
             onPlayPause={() => {
               void handlePlayPause();
@@ -4879,8 +5068,8 @@ function App() {
             className="listen-mode-button"
             type="button"
             onClick={handleStartListening}
-            disabled={!hasVoice || isLoadingAudio}
-            aria-label="Dokument anhören"
+            disabled={isLoadingAudio}
+            aria-label={hasVoice ? "Dokument anhören" : "Stimme auswählen und herunterladen"}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M8.25 6.1c0-1.03 1.12-1.67 2.02-1.15l8.25 4.78c.89.52.89 1.8 0 2.32l-8.25 4.78c-.9.52-2.02-.12-2.02-1.15V6.1Z" fill="currentColor" />

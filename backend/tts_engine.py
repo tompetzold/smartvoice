@@ -23,7 +23,7 @@ from tts_text import normalize_german_tts_text
 LOGGER = logging.getLogger("uvicorn.error")
 
 DEFAULT_VOICE_ID = "piper:de_DE-thorsten-high"
-CACHE_VERSION = "thorsten-variants-v1"
+CACHE_VERSION = "thorsten-variants-v2-declick"
 
 PIPER_REPO_BASE = "https://huggingface.co/Thorsten-Voice/Piper/resolve/main"
 KOKORO_REPO_BASE = "https://huggingface.co/Thorsten-Voice/Kokoro/resolve/main"
@@ -137,6 +137,7 @@ class TtsEngine:
         self._download_cancel_events: dict[str, threading.Event] = {}
         self._active_download_processes: dict[str, subprocess.Popen[str]] = {}
         self._kokoro_runtime: tuple[Any, Any, Any] | None = None
+        self._piper_runtime_cache: dict[tuple[str, str], Any] = {}
         self.download_state_path = self.models_dir / "download-state.json"
 
         self.piper_voices_dir.mkdir(parents=True, exist_ok=True)
@@ -248,13 +249,51 @@ class TtsEngine:
         return False
 
     def _download_state_for(self, voice_id: str, downloaded: bool) -> dict[str, Any]:
-        with self._download_lock:
-            state = self._download_states.get(voice_id)
-            if state is not None:
-                return dict(state)
-
         entry = self._catalog_entry(voice_id)
         total_bytes = int(entry.get("requiredBytes", 0) or 0)
+
+        with self._download_lock:
+            state = self._download_states.get(voice_id)
+
+            if state is not None:
+                current = dict(state)
+                state_name = str(current.get("state", "idle"))
+
+                # A persisted "ready" state is only valid while the actual model
+                # files still exist. This matters after moving between dev mode
+                # and the packaged macOS app, where the writable data directory
+                # is intentionally different.
+                if not downloaded and state_name == "ready":
+                    current = {
+                        "state": "idle",
+                        "progress": 0,
+                        "message": "",
+                        "error": "",
+                        "downloadBytes": 0,
+                        "downloadTotalBytes": total_bytes,
+                        "downloadBytesExact": False,
+                    }
+                    self._download_states[voice_id] = current
+                    self._persist_download_states_locked()
+                    return dict(current)
+
+                # Likewise, if all model files are present, recover cleanly from
+                # an old error/idle state left over by an interrupted previous run.
+                if downloaded and state_name not in {"downloading", "paused"}:
+                    current = {
+                        "state": "ready",
+                        "progress": 100,
+                        "message": "Installiert",
+                        "error": "",
+                        "downloadBytes": total_bytes,
+                        "downloadTotalBytes": total_bytes,
+                        "downloadBytesExact": True,
+                    }
+                    self._download_states[voice_id] = current
+                    self._persist_download_states_locked()
+                    return dict(current)
+
+                return current
 
         return {
             "state": "ready" if downloaded else "idle",
@@ -870,26 +909,49 @@ class TtsEngine:
             raise RuntimeError(output[-3000:] if output else f"{message} fehlgeschlagen.")
 
     def _ensure_kokoro_runtime(self, voice_id: str) -> None:
-        basic = {
+        requirements = {
             "huggingface_hub": "huggingface_hub",
             "soundfile": "soundfile",
             "numpy": "numpy",
             "torch": "torch",
+            "misaki": "misaki",
+            "kokoro": "kokoro",
         }
+
         missing_packages = [
             package
-            for module, package in basic.items()
+            for module, package in requirements.items()
             if importlib.util.find_spec(module) is None
         ]
-        if missing_packages:
+
+        if not missing_packages:
+            return
+
+        # In a PyInstaller bundle sys.executable points to SmartVoice itself,
+        # not to a Python interpreter. Running "sys.executable -m pip" would
+        # therefore start a second SmartVoice instance instead of installing
+        # anything. Runtime dependencies must be bundled at build time.
+        if getattr(sys, "frozen", False):
+            raise RuntimeError(
+                "Kokoro-Laufzeit fehlt im SmartVoice-Build: "
+                + ", ".join(missing_packages)
+            )
+
+        basic_packages = [
+            package
+            for package in ("huggingface_hub", "soundfile", "numpy", "torch")
+            if package in missing_packages
+        ]
+
+        if basic_packages:
             self._run_install(
                 voice_id,
-                [sys.executable, "-m", "pip", "install", *missing_packages],
+                [sys.executable, "-m", "pip", "install", *basic_packages],
                 "Installiere Kokoro-Laufzeit",
                 4,
             )
 
-        if importlib.util.find_spec("misaki") is None:
+        if "misaki" in missing_packages:
             self._run_install(
                 voice_id,
                 [
@@ -903,7 +965,7 @@ class TtsEngine:
                 6,
             )
 
-        if importlib.util.find_spec("kokoro") is None:
+        if "kokoro" in missing_packages:
             self._run_install(
                 voice_id,
                 [
@@ -916,6 +978,7 @@ class TtsEngine:
                 "Installiere Kokoro",
                 8,
             )
+
         importlib.invalidate_caches()
 
     def _download_kokoro(self, entry: dict[str, Any]) -> None:
@@ -1059,6 +1122,116 @@ class TtsEngine:
         except (wave.Error, EOFError, OSError):
             return False
 
+    def _apply_wav_edge_fades(
+        self,
+        path: Path,
+        fade_in_ms: float = 12.0,
+        fade_out_ms: float = 24.0,
+    ) -> None:
+        """Remove click transients at independently generated TTS chunk edges.
+
+        The browser-side volume ramp is intentionally kept as a second safety
+        layer, but JavaScript timers and HTMLMediaElement.volume are not
+        sample-accurate. This function modifies the PCM samples themselves so
+        every cached WAV starts and ends exactly at digital zero.
+        """
+        if not self._valid_wav_file(path):
+            return
+
+        try:
+            with wave.open(str(path), "rb") as wav_file:
+                params = wav_file.getparams()
+                channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                frame_rate = wav_file.getframerate()
+                frame_count = wav_file.getnframes()
+                compression = wav_file.getcomptype()
+                pcm = bytearray(wav_file.readframes(frame_count))
+        except (wave.Error, EOFError, OSError):
+            return
+
+        if (
+            compression != "NONE"
+            or channels <= 0
+            or frame_rate <= 0
+            or frame_count <= 1
+            or sample_width not in (1, 2, 3, 4)
+        ):
+            return
+
+        fade_in_frames = min(
+            frame_count,
+            max(1, round(frame_rate * max(0.0, fade_in_ms) / 1000.0)),
+        )
+        fade_out_frames = min(
+            frame_count,
+            max(1, round(frame_rate * max(0.0, fade_out_ms) / 1000.0)),
+        )
+
+        bytes_per_frame = channels * sample_width
+
+        def sample_gain(frame_index: int) -> float:
+            gain = 1.0
+
+            if fade_in_frames > 1 and frame_index < fade_in_frames:
+                gain = min(
+                    gain,
+                    frame_index / float(fade_in_frames - 1),
+                )
+
+            fade_out_start = frame_count - fade_out_frames
+            if fade_out_frames > 1 and frame_index >= fade_out_start:
+                remaining = frame_count - 1 - frame_index
+                gain = min(
+                    gain,
+                    remaining / float(fade_out_frames - 1),
+                )
+
+            return max(0.0, min(1.0, gain))
+
+        for frame_index in range(frame_count):
+            gain = sample_gain(frame_index)
+
+            if gain >= 0.999999:
+                continue
+
+            frame_offset = frame_index * bytes_per_frame
+
+            for channel in range(channels):
+                offset = frame_offset + channel * sample_width
+
+                if sample_width == 1:
+                    # 8-bit PCM WAV uses unsigned samples centered at 128.
+                    centered = pcm[offset] - 128
+                    scaled = int(round(centered * gain))
+                    pcm[offset] = max(0, min(255, scaled + 128))
+                    continue
+
+                raw = pcm[offset : offset + sample_width]
+                sample = int.from_bytes(raw, byteorder="little", signed=True)
+                scaled = int(round(sample * gain))
+
+                min_value = -(1 << (sample_width * 8 - 1))
+                max_value = (1 << (sample_width * 8 - 1)) - 1
+                scaled = max(min_value, min(max_value, scaled))
+
+                pcm[offset : offset + sample_width] = scaled.to_bytes(
+                    sample_width,
+                    byteorder="little",
+                    signed=True,
+                )
+
+        temp_path = path.with_name(f"{path.name}.declick.tmp")
+
+        try:
+            with wave.open(str(temp_path), "wb") as wav_file:
+                wav_file.setparams(params)
+                wav_file.writeframes(bytes(pcm))
+
+            temp_path.replace(path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
     def _sanitize_piper_text(self, text: str) -> str:
         value = unicodedata.normalize("NFKC", str(text))
         for source, target in {
@@ -1098,6 +1271,47 @@ class TtsEngine:
         value = re.sub(r"\s+([,.;:!?])", r"\1", value).strip()
         return value if any(char.isalnum() for char in value) else ""
 
+    def _load_piper_runtime(
+        self,
+        model_path: Path,
+        config_path: Path,
+    ) -> Any:
+        cache_key = (
+            str(model_path.resolve()),
+            str(config_path.resolve()),
+        )
+
+        cached = self._piper_runtime_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            try:
+                from piper import PiperVoice
+            except ImportError:
+                from piper.voice import PiperVoice
+        except Exception as error:
+            raise RuntimeError("Piper-Python-API ist nicht verfügbar.") from error
+
+        try:
+            # Current piper-tts automatically picks up <model>.onnx.json.
+            voice = PiperVoice.load(str(model_path))
+        except Exception as first_error:
+            try:
+                # Compatibility path for Piper versions that accept the config
+                # path explicitly.
+                voice = PiperVoice.load(
+                    str(model_path),
+                    str(config_path),
+                )
+            except Exception as second_error:
+                raise RuntimeError(
+                    f"Piper-Modell konnte nicht geladen werden: {second_error}"
+                ) from first_error
+
+        self._piper_runtime_cache[cache_key] = voice
+        return voice
+
     def _synthesize_piper(
         self,
         spec: VoiceSpec,
@@ -1107,6 +1321,7 @@ class TtsEngine:
     ) -> None:
         if not self._piper_available():
             raise RuntimeError("Piper ist nicht installiert.")
+
         files = self._find_piper_files(spec.piper_voice_id)
         if files is None:
             raise FileNotFoundError(f"Piper-Modell fehlt: {spec.id}")
@@ -1116,26 +1331,27 @@ class TtsEngine:
         if not safe_text:
             raise ValueError("Piper-TTS-Text enthält keinen sprechbaren Inhalt.")
 
+        self._check_session(session_id)
+        voice = self._load_piper_runtime(model_path, config_path)
+        self._check_session(session_id)
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.unlink(missing_ok=True)
-        returncode, stdout, stderr = self._run_cancellable_process(
-            [
-                sys.executable,
-                "-m",
-                "piper",
-                "-m",
-                str(model_path),
-                "-c",
-                str(config_path),
-                "-f",
-                str(output_path),
-            ],
-            session_id,
-            safe_text,
-        )
-        if returncode != 0 or not self._valid_wav_file(output_path):
+
+        try:
+            with wave.open(str(output_path), "wb") as wav_file:
+                voice.synthesize_wav(safe_text, wav_file)
+
+            self._check_session(session_id)
+
+            if not self._valid_wav_file(output_path):
+                raise RuntimeError("Piper hat kein gültiges Audio erzeugt.")
+        except TtsCancelledError:
             output_path.unlink(missing_ok=True)
-            raise RuntimeError(stderr.strip() or stdout.strip() or "Piper hat kein Audio erzeugt.")
+            raise
+        except Exception:
+            output_path.unlink(missing_ok=True)
+            raise
 
     def _load_kokoro_runtime(self) -> tuple[Any, Any, Any]:
         if self._kokoro_runtime is not None:
@@ -1236,6 +1452,12 @@ class TtsEngine:
                 self._synthesize_kokoro(normalized, output_path, session_id)
             else:
                 raise RuntimeError(f"Unbekannter Provider: {spec.provider}")
+
+            self._apply_wav_edge_fades(output_path)
+
+            if not self._valid_wav_file(output_path):
+                output_path.unlink(missing_ok=True)
+                raise RuntimeError("TTS hat nach der Audio-Nachbearbeitung keine gültige WAV-Datei erzeugt.")
 
         return {
             "voiceId": spec.id,

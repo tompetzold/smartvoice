@@ -1,18 +1,37 @@
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Python
 .venv/
+venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
+# Backend runtime data
 backend/data/
 backend/outputs/
 outputs/
 
+# Frontend
 frontend/node_modules/
 frontend/dist/
 
-.DS_Store
+# Environment
 .env
 .env.*
+!.env.example
 
-.idea/
+# PyInstaller / generated builds
+dist/
+build/
+.build-backend/
+*.spec
+
+# Logs
+*.log

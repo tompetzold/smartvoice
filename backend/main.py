@@ -23,7 +23,14 @@ from tts_text import normalize_german_tts_text
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+
+_data_dir_override = os.environ.get("SMARTVOICE_DATA_DIR")
+
+if _data_dir_override:
+    DATA_DIR = Path(_data_dir_override).expanduser().resolve()
+else:
+    DATA_DIR = BASE_DIR / "data"
+
 UPLOAD_DIR = DATA_DIR / "uploads"
 DOCUMENTS_DIR = DATA_DIR / "documents"
 PIPER_VOICES_DIR = DATA_DIR / "piper_voices"
