@@ -1,0 +1,10 @@
+-r requirements.txt
+
+# Kokoro runtime. PyTorch itself is installed separately from the official
+# CPU-only PyTorch index in the Dockerfile.
+huggingface-hub>=0.30
+soundfile>=0.13
+numpy
+
+git+https://github.com/semidark/misaki.git@6d252a2e02f3b030f22f56686f1a73786c16ffc8
+git+https://github.com/semidark/kokoro.git
